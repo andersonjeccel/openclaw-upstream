@@ -310,6 +310,22 @@ extension OpenClawChatTransport {
 public enum OpenClawChatSessionRoutingContract {
     public static let changedErrorReason = "session-routing-changed"
 
+    public struct Components: Equatable, Sendable {
+        public let scope: String
+        public let mainKey: String
+        public let defaultAgentID: String
+    }
+
+    /// Live sends may proceed before routing identity is available. Queued
+    /// replay acquires a separate route lease and never uses a nil contract.
+    public static func expectedValue(
+        _ contract: String?,
+        serverSupportsGuard: Bool) -> String?
+    {
+        guard serverSupportsGuard else { return nil }
+        return self.normalize(contract)
+    }
+
     public static func make(
         scope: String?,
         mainKey: String?,
@@ -320,6 +336,21 @@ public enum OpenClawChatSessionRoutingContract {
         let normalizedDefaultAgentID = self.normalize(defaultAgentID)
         guard let normalizedScope, let normalizedMainKey, let normalizedDefaultAgentID else { return nil }
         return "\(normalizedScope)|\(normalizedMainKey)|\(normalizedDefaultAgentID)"
+    }
+
+    /// Scope and agent ids cannot contain `|`; parse from both ends so an
+    /// older custom main key containing the delimiter still round-trips.
+    public static func parse(_ contract: String?) -> Components? {
+        guard let normalized = self.normalize(contract),
+              let firstSeparator = normalized.firstIndex(of: "|"),
+              let lastSeparator = normalized.lastIndex(of: "|"),
+              firstSeparator != lastSeparator
+        else { return nil }
+        let scope = String(normalized[..<firstSeparator])
+        let mainKey = String(normalized[normalized.index(after: firstSeparator)..<lastSeparator])
+        let defaultAgentID = String(normalized[normalized.index(after: lastSeparator)...])
+        guard !scope.isEmpty, !mainKey.isEmpty, !defaultAgentID.isEmpty else { return nil }
+        return Components(scope: scope, mainKey: mainKey, defaultAgentID: defaultAgentID)
     }
 
     private static func normalize(_ value: String?) -> String? {

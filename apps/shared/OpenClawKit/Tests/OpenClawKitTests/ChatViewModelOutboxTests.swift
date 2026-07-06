@@ -422,7 +422,7 @@ private func queuedStateCount(_ vm: OpenClawChatViewModel) -> Int {
 /// Forwarding outbox that can delay `loadCommands`, making restore-vs-send
 /// interleavings deterministic in tests.
 private actor DelayingOutbox: OpenClawChatCommandOutbox {
-    private let base: OpenClawChatSQLiteTranscriptCache
+    private nonisolated let base: OpenClawChatSQLiteTranscriptCache
     private var loadDelayNanoseconds: UInt64 = 0
     private var recoveryAvailable = true
     private var terminalWritesAvailable = true
@@ -430,6 +430,10 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
 
     init(base: OpenClawChatSQLiteTranscriptCache) {
         self.base = base
+    }
+
+    nonisolated func changes() -> AsyncStream<OpenClawChatOutboxChange> {
+        self.base.changes()
     }
 
     func setLoadDelayNanoseconds(_ delay: UInt64) {
@@ -485,10 +489,6 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
         await self.base.markCommandAwaitingConfirmation(id: id)
     }
 
-    func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
-        await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
     func markCommandFailedIfPresent(
         id: String,
         retryCount: Int,
@@ -496,10 +496,6 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
     {
         guard self.terminalWritesAvailable else { return .unavailable }
         return await self.base.markCommandFailedIfPresent(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
-    func markCommandRetried(id: String) async {
-        await self.base.markCommandRetried(id: id)
     }
 
     func markCommandRetriedIfPresent(
@@ -515,8 +511,12 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
             routingContract: routingContract)
     }
 
-    func deleteCommand(id: String) async {
-        await self.base.deleteCommand(id: id)
+    func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.cancelCommand(id: id)
+    }
+
+    func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.confirmCommand(id: id)
     }
 }
 
@@ -591,20 +591,12 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
         await self.base.markCommandAwaitingConfirmation(id: id)
     }
 
-    func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
-        await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
     func markCommandFailedIfPresent(
         id: String,
         retryCount: Int,
         lastError: String?) async -> OpenClawChatOutboxUpdateResult
     {
         await self.base.markCommandFailedIfPresent(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
-    func markCommandRetried(id: String) async {
-        await self.base.markCommandRetried(id: id)
     }
 
     func markCommandRetriedIfPresent(
@@ -626,10 +618,6 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
 
     func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
         await self.base.confirmCommand(id: id)
-    }
-
-    func deleteCommand(id: String) async {
-        await self.base.deleteCommand(id: id)
     }
 }
 
@@ -685,20 +673,12 @@ private actor CancellationHoldingOutbox: OpenClawChatCommandOutbox {
         await self.base.markCommandAwaitingConfirmation(id: id)
     }
 
-    func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
-        await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
     func markCommandFailedIfPresent(
         id: String,
         retryCount: Int,
         lastError: String?) async -> OpenClawChatOutboxUpdateResult
     {
         await self.base.markCommandFailedIfPresent(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
-    func markCommandRetried(id: String) async {
-        await self.base.markCommandRetried(id: id)
     }
 
     func markCommandRetriedIfPresent(
@@ -723,10 +703,6 @@ private actor CancellationHoldingOutbox: OpenClawChatCommandOutbox {
 
     func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
         await self.base.confirmCommand(id: id)
-    }
-
-    func deleteCommand(id: String) async {
-        await self.base.deleteCommand(id: id)
     }
 }
 
@@ -806,6 +782,37 @@ struct ChatViewModelOutboxTests {
         }
         #expect(await store.loadCommands().map(\.status) == [.queued])
         #expect(await transport.state.sentMessages.isEmpty)
+    }
+
+    @Test func `inert outbox does not capability gate healthy live chat`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(
+            healthy: true,
+            routeUnavailableReason: OpenClawChatTransportUpgradeMessage.routingContract)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { vm.load() }
+        try await waitUntil("empty outbox restore completes") {
+            await MainActor.run { vm.hasRestoredOutboxMessages }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await MainActor.run { vm.healthOK })
+        #expect(await MainActor.run { vm.errorText == nil })
+
+        var parked = outboxTestCommand(id: "c-parked", text: "review me", createdAt: 1)
+        parked.status = .failed
+        parked.lastError = OpenClawChatSQLiteTranscriptCache.outboxChangedTargetError
+        #expect(await store.enqueueCommand(parked))
+        let parkedVM = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run { parkedVM.load() }
+        try await waitUntil("parked outbox restore completes") {
+            await MainActor.run { parkedVM.hasRestoredOutboxMessages }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await MainActor.run { parkedVM.healthOK })
+        #expect(await MainActor.run { parkedVM.errorText == nil })
     }
 
     @Test func `legacy transport preserves its untargeted session key`() async throws {

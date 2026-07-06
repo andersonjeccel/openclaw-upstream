@@ -1096,8 +1096,11 @@ struct ChatCommandOutboxStoreTests {
         #expect(loaded.map(\.retryCount) == [2])
         #expect(loaded.map(\.lastError) == ["socket closed"])
 
-        // Legacy public operation remains unconditional for queued rows.
-        await store.markCommandFailed(id: "c-1", retryCount: 3, lastError: "gave up")
+        #expect(await store.claimNextCommand()?.id == "c-1")
+        #expect(await store.markCommandFailedIfPresent(
+            id: "c-1",
+            retryCount: 3,
+            lastError: "gave up") == .updated)
         loaded = await store.loadCommands()
         #expect(loaded.map(\.status) == [.failed])
         #expect(loaded.map(\.retryCount) == [3])

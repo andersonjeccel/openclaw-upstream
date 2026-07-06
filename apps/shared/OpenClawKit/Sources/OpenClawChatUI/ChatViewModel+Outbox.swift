@@ -440,6 +440,25 @@ extension OpenClawChatViewModel {
 
     private func performOutboxFlush() async {
         guard let outbox else { return }
+        let presentationGeneration = self.outboxPresentationGeneration
+        guard let initialCommands = await outbox.loadCommandsIfAvailable() else {
+            self.applyTransportHealth(false)
+            return
+        }
+        guard presentationGeneration == self.outboxPresentationGeneration else {
+            self.isOutboxFlushRequestedWhileActive = true
+            return
+        }
+        let visibleSession = self.currentSessionSnapshot()
+        self.presentOutboxCommands(initialCommands.filter { self.commandMatchesTarget($0, session: visibleSession) })
+        // Do not capability-gate ordinary live chat when no durable work
+        // needs a replay lease (notably against older gateways).
+        let hasRouteWork = initialCommands.contains { command in
+            command.status == .queued ||
+                command.status == .sending ||
+                Self.needsOutboxDeliveryReconciliation(command)
+        }
+        guard hasRouteWork else { return }
         let routeResult = await self.transport.acquireOutboxRouteLease()
         guard case let .available(routeLease) = routeResult else {
             // The store owner no longer matches the active gateway route.

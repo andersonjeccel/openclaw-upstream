@@ -594,11 +594,6 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
     {
-        let normalizedContract = expectedSessionRoutingContract?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let normalizedContract, !normalizedContract.isEmpty else {
-            throw OpenClawChatTransportSendError.notDispatched
-        }
         let route: GatewayNodeSessionRoute? = if let outboxGatewayID {
             await self.gateway.currentRoute(ifGatewayID: outboxGatewayID)
         } else {
@@ -613,7 +608,9 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         // acquireOutboxRouteLease. Keep ordinary live chat compatible with
         // older gateways by retaining the captured route but omitting the
         // unsupported request field.
-        let guardedContract = supportsRoutingContract ? normalizedContract : nil
+        let guardedContract = OpenClawChatSessionRoutingContract.expectedValue(
+            expectedSessionRoutingContract,
+            serverSupportsGuard: supportsRoutingContract)
         return try await self.sendMessage(
             sessionKey: sessionKey,
             agentID: agentID,

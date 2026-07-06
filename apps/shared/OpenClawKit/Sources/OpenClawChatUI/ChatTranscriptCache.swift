@@ -267,17 +267,12 @@ public protocol OpenClawChatCommandOutbox: Sendable {
     func claimNextCommand() async -> OpenClawChatOutboxCommand?
     func markCommandQueued(id: String, retryCount: Int, lastError: String?) async
     func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult
-    func markCommandFailed(id: String, retryCount: Int, lastError: String?) async
     /// Result-bearing terminal transition for callers that must stop their
     /// FIFO when durable storage is unavailable.
     func markCommandFailedIfPresent(
         id: String,
         retryCount: Int,
         lastError: String?) async -> OpenClawChatOutboxUpdateResult
-    /// Explicit user retry: reset attempts and refresh `createdAt` so an
-    /// expired row can send again (retry is new intent, so it also moves the
-    /// command to the queue tail rather than replaying its old position).
-    func markCommandRetried(id: String) async
     /// Result-bearing retry used to adopt an unowned legacy alias into the
     /// canonical target explicitly selected by the user.
     func markCommandRetriedIfPresent(
@@ -291,56 +286,8 @@ public protocol OpenClawChatCommandOutbox: Sendable {
     /// Canonical gateway history may complete any row, including a sending
     /// row whose request ACK was lost.
     func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult
-    /// Legacy unconditional deletion seam. Retained for source compatibility;
-    /// new UI cancellation must use `cancelCommand` so a claimed send wins.
-    func deleteCommand(id: String) async
-    /// Cross-view-model invalidation. Legacy conformers get a finished stream
-    /// and retain their existing single-view behavior.
+    /// Cross-view-model invalidation.
     func changes() -> AsyncStream<OpenClawChatOutboxChange>
-}
-
-extension OpenClawChatCommandOutbox {
-    public func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]? {
-        // The legacy API cannot distinguish an empty queue from unreadable
-        // storage. Only an explicit conformer override may open the FIFO gate.
-        nil
-    }
-
-    public func markCommandFailedIfPresent(
-        id _: String,
-        retryCount _: Int,
-        lastError _: String?) async -> OpenClawChatOutboxUpdateResult
-    {
-        // Preserve source compatibility without inventing durable success:
-        // legacy conformers cannot report availability or row eligibility.
-        .unavailable
-    }
-
-    public func markCommandRetriedIfPresent(
-        id _: String,
-        agentID _: String?,
-        deliverySessionKey _: String,
-        routingContract _: String) async -> OpenClawChatOutboxUpdateResult
-    {
-        // Legacy conformers cannot prove durable retargeting.
-        .unavailable
-    }
-
-    public func cancelCommand(id _: String) async -> OpenClawChatOutboxUpdateResult {
-        // A legacy conformer cannot prove atomic status eligibility. Refuse
-        // cancellation instead of hiding a row whose send may still land.
-        .unavailable
-    }
-
-    public func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
-        // Canonical gateway history makes unconditional legacy deletion safe.
-        await deleteCommand(id: id)
-        return .updated
-    }
-
-    public func changes() -> AsyncStream<OpenClawChatOutboxChange> {
-        AsyncStream { $0.finish() }
-    }
 }
 
 public struct OpenClawChatSessionRoutingIdentity: Equatable, Sendable {
@@ -350,16 +297,11 @@ public struct OpenClawChatSessionRoutingIdentity: Equatable, Sendable {
     public let contract: String
 
     public init?(contract: String?) {
-        let normalized = contract?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let normalized, !normalized.isEmpty else { return nil }
-        let parts = normalized.split(separator: "|", omittingEmptySubsequences: false)
-        guard parts.count == 3,
-              parts.allSatisfy({ !$0.isEmpty })
-        else { return nil }
-        self.scope = String(parts[0])
-        self.mainSessionKey = String(parts[1])
-        self.defaultAgentID = String(parts[2])
-        self.contract = normalized
+        guard let components = OpenClawChatSessionRoutingContract.parse(contract) else { return nil }
+        self.scope = components.scope
+        self.mainSessionKey = components.mainKey
+        self.defaultAgentID = components.defaultAgentID
+        self.contract = "\(components.scope)|\(components.mainKey)|\(components.defaultAgentID)"
     }
 
     public init?(scope: String?, mainSessionKey: String?, defaultAgentID: String?) {
@@ -908,14 +850,6 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
         return sqlite3_changes(db) > 0 ? .updated : .missing
     }
 
-    public func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
-        await self.updateCommandStatus(
-            id: id,
-            status: "failed",
-            retryCount: retryCount,
-            lastError: lastError)
-    }
-
     public func markCommandFailedIfPresent(
         id: String,
         retryCount: Int,
@@ -939,19 +873,6 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
             return .unavailable
         }
         return sqlite3_changes(db) > 0 ? .updated : .missing
-    }
-
-    public func markCommandRetried(id: String) async {
-        guard !self.isRetired, let db = await handle() else { return }
-        // Fresh createdAt: without it the staleness gate would immediately
-        // re-expire a retried row that sat offline past the 48h bound.
-        self.execute(
-            db,
-            sql: """
-            UPDATE outbox_commands SET status = 'queued', retry_count = 0, last_error = '', created_at = ?3
-            WHERE gateway_id = ?1 AND client_uuid = ?2
-            """,
-            bindings: [self.gatewayID, id, Date().timeIntervalSince1970])
     }
 
     public func markCommandRetriedIfPresent(
@@ -1102,10 +1023,6 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
         guard sqlite3_changes(db) > 0 else { return .missing }
         self.emitOutboxChange(.confirmed(id: id))
         return .updated
-    }
-
-    public func deleteCommand(id: String) async {
-        _ = await self.confirmCommand(id: id)
     }
 
     private func emitOutboxChange(_ change: OpenClawChatOutboxChange) {

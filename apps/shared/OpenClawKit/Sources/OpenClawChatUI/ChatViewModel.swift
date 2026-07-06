@@ -467,11 +467,7 @@ public final class OpenClawChatViewModel {
             .split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
         let normalizedMainSessionKey = String(resolvedMainParts.last ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let contractParts = (contract ?? "")
-            .split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
-        let contractMainKey = contractParts.count == 3
-            ? contractParts[1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            : ""
+        let contractMainKey = OpenClawChatSessionRoutingContract.parse(contract)?.mainKey ?? ""
         return normalizedSessionKey == "global" ||
             normalizedSessionKey == "main" ||
             normalizedSessionKey == normalizedMainSessionKey ||

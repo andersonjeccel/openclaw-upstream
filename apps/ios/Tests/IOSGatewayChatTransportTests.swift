@@ -44,6 +44,29 @@ struct IOSGatewayChatTransportTests {
         #expect(try IOSGatewayChatTransport.decodeSessionRoutingContract(data) == "global|work|ops")
     }
 
+    @Test func `live routing guard permits an identity still loading`() {
+        #expect(OpenClawChatSessionRoutingContract.expectedValue(
+            nil,
+            serverSupportsGuard: true) == nil)
+        #expect(OpenClawChatSessionRoutingContract.expectedValue(
+            " per-sender|main|reviewer ",
+            serverSupportsGuard: true) == "per-sender|main|reviewer")
+        #expect(OpenClawChatSessionRoutingContract.expectedValue(
+            "per-sender|main|reviewer",
+            serverSupportsGuard: false) == nil)
+    }
+
+    @Test func `routing contract round trips a delimited legacy main key`() throws {
+        let contract = try #require(OpenClawChatSessionRoutingContract.make(
+            scope: "per-sender",
+            mainKey: "team|primary",
+            defaultAgentID: "main"))
+        let components = try #require(OpenClawChatSessionRoutingContract.parse(contract))
+        #expect(components.scope == "per-sender")
+        #expect(components.mainKey == "team|primary")
+        #expect(components.defaultAgentID == "main")
+    }
+
     @Test func `hello advertises guarded chat send capability`() throws {
         let data = Data(
             #"{"type":"hello-ok","protocol":4,"server":{"version":"test","connId":"test"},"features":{"methods":[],"events":[],"capabilities":["chat-send-routing-contract"]},"snapshot":{"presence":[],"health":{},"stateVersion":{"presence":0,"health":0},"uptimeMs":0},"auth":{},"policy":{}}"#

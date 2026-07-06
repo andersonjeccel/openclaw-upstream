@@ -138,11 +138,6 @@ struct MacGatewayChatTransport: OpenClawChatTransport {
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
     {
-        let normalizedContract = expectedSessionRoutingContract?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let normalizedContract, !normalizedContract.isEmpty else {
-            throw OpenClawChatTransportSendError.notDispatched
-        }
         if let outboxGatewayID {
             try await Self.requireGateway(outboxGatewayID)
         }
@@ -154,7 +149,9 @@ struct MacGatewayChatTransport: OpenClawChatTransport {
         // Outbox replay is capability-gated in acquireOutboxRouteLease. A
         // live send keeps its captured route on older gateways and omits the
         // unsupported atomic routing field.
-        let guardedContract = supportsRoutingContract ? normalizedContract : nil
+        let guardedContract = OpenClawChatSessionRoutingContract.expectedValue(
+            expectedSessionRoutingContract,
+            serverSupportsGuard: supportsRoutingContract)
         return try await GatewayConnection.shared.chatSend(
             sessionKey: sessionKey,
             agentID: agentID,
