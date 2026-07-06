@@ -16,14 +16,21 @@ extension OpenClawChatViewModel {
         self.markTimelineChanged()
     }
 
-    func persistTranscriptToCache(sessionKey: String, messages: [OpenClawChatMessage]) {
+    func persistTranscriptToCache(
+        sessionKey: String,
+        messages: [OpenClawChatMessage],
+        canonicalMessageIdempotencyKeys: Set<String>)
+    {
         guard let transcriptCache else { return }
         // Chain writes so an older snapshot can never land after a newer one;
         // detached tasks alone give no ordering guarantee across awaits.
         let previous = self.pendingCacheWriteTask
         self.pendingCacheWriteTask = Task.detached {
             await previous?.value
-            await transcriptCache.storeTranscript(sessionKey: sessionKey, messages: messages)
+            await transcriptCache.storeCanonicalTranscript(
+                sessionKey: sessionKey,
+                messages: messages,
+                canonicalMessageIdempotencyKeys: canonicalMessageIdempotencyKeys)
         }
     }
 

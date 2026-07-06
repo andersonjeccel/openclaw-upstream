@@ -21,10 +21,10 @@ public enum OpenClawChatOutboxMessageState: Equatable, Sendable {
     }
 }
 
-// Durable offline command outbox. Sends made while the gateway is unhealthy
-// are persisted (per gateway, alongside the transcript cache) and flushed
-// strictly in createdAt order when health recovers. A gateway ACK only moves
-// a row to awaiting-confirmation; canonical history owns durable completion.
+/// Durable offline command outbox. Sends made while the gateway is unhealthy
+/// are persisted (per gateway, alongside the transcript cache) and flushed
+/// strictly in createdAt order when health recovers. A gateway ACK only moves
+/// a row to awaiting-confirmation; canonical history owns durable completion.
 extension OpenClawChatViewModel {
     public func outboxState(for messageID: UUID) -> OpenClawChatOutboxMessageState? {
         self.outboxStatesByMessageID[messageID]
@@ -53,6 +53,11 @@ extension OpenClawChatViewModel {
                 self.errorText = "Could not delete the queued message. Try again."
                 return
             }
+            if result == .confirmed {
+                self.finishOutboxCancellation(commandID)
+                self.clearOutboxState(forCommandID: commandID)
+                return
+            }
             if result == .missing {
                 let presentationGeneration = self.outboxPresentationGeneration
                 let current = await outbox.loadCommands().first(where: { $0.id == commandID })
@@ -68,6 +73,11 @@ extension OpenClawChatViewModel {
                     self.presentOutboxCommands([current])
                     return
                 }
+            }
+            if self.canonicalOutboxMessageKeys.contains("\(commandID):user") {
+                self.finishOutboxCancellation(commandID)
+                self.clearOutboxState(forCommandID: commandID)
+                return
             }
             self.finishOutboxCancellation(commandID)
             self.outboxCommandIDsByMessageID.removeValue(forKey: messageID)
@@ -192,12 +202,14 @@ extension OpenClawChatViewModel {
     /// outbox row—including a lost-ACK queued row—is now safe to remove
     /// without replaying the user turn.
     func confirmOutboxCommands(in messages: [OpenClawChatMessage]) {
+        self.observeCanonicalOutboxMessageKeys(in: messages)
         Task { [weak self] in
             await self?.confirmOutboxCommandsNow(in: messages)
         }
     }
 
     func confirmOutboxCommandsNow(in messages: [OpenClawChatMessage]) async {
+        self.observeCanonicalOutboxMessageKeys(in: messages)
         guard let outbox else { return }
         let confirmedKeys = Set(messages.compactMap { Self.normalizedIdempotencyKey($0.idempotencyKey) })
         guard !confirmedKeys.isEmpty else { return }
@@ -212,6 +224,18 @@ extension OpenClawChatViewModel {
                 self.clearOutboxState(forCommandID: command.id)
             }
         }
+    }
+
+    private func observeCanonicalOutboxMessageKeys(in messages: [OpenClawChatMessage]) {
+        let keys = Set(messages.compactMap(\.idempotencyKey))
+        for key in keys.sorted() {
+            self.canonicalOutboxMessageKeys.removeAll(where: { $0 == key })
+            self.canonicalOutboxMessageKeys.append(key)
+        }
+        if self.canonicalOutboxMessageKeys.count > 512 {
+            self.canonicalOutboxMessageKeys.removeFirst(self.canonicalOutboxMessageKeys.count - 512)
+        }
+        self.transcriptCache?.observeCanonicalMessageIdempotencyKeys(keys)
     }
 
     /// Appends bubbles for commands in the current session, adopting rows
@@ -330,13 +354,17 @@ extension OpenClawChatViewModel {
             return
         }
         await self.recoverInterruptedOutboxSendsIfNeeded()
-        var flushedSessionKeys: Set<String> = []
+        var confirmationSessionKeys: Set<String> = []
         while self.healthOK {
             let presentationGeneration = self.outboxPresentationGeneration
             let commands = await outbox.loadCommands()
             if presentationGeneration != self.outboxPresentationGeneration {
                 continue
             }
+            confirmationSessionKeys.formUnion(
+                commands.lazy
+                    .filter { $0.status == .awaitingConfirmation }
+                    .map(\.sessionKey))
             self.presentOutboxCommands(commands.filter { $0.sessionKey == self.sessionKey })
             guard let next = await outbox.claimNextCommand() else { break }
             // Same ordering contract as the live send path: a run must not
@@ -387,7 +415,7 @@ extension OpenClawChatViewModel {
                     self.clearOutboxState(forCommandID: next.id)
                 }
                 self.outboxTransportFailureStreak = 0
-                flushedSessionKeys.insert(next.sessionKey)
+                confirmationSessionKeys.insert(next.sessionKey)
             } catch is CancellationError {
                 // The leased gateway route changed while the request was
                 // suspended. Never reacquire inside this pass: doing so could
@@ -435,9 +463,9 @@ extension OpenClawChatViewModel {
                 break
             }
         }
-        if !flushedSessionKeys.isEmpty {
+        if !confirmationSessionKeys.isEmpty {
             await self.refreshHistoriesAfterOutboxFlush(
-                sessionKeys: flushedSessionKeys,
+                sessionKeys: confirmationSessionKeys,
                 routeLease: routeLease)
         }
     }
@@ -521,6 +549,10 @@ extension OpenClawChatViewModel {
         self.outboxPresentationGeneration &+= 1
         switch change {
         case let .canceled(commandID):
+            // The initiating view owns its async result so canonical proof
+            // observed before that continuation can still preserve the row.
+            // Other views have no local cancellation task and apply the event.
+            guard !self.cancelingOutboxCommandIDs.contains(commandID) else { return }
             guard let messageID = self.outboxMessageIDsByCommandID[commandID] else { return }
             self.clearOutboxState(forCommandID: commandID)
             self.replaceMessages(self.messages.filter { $0.id != messageID })

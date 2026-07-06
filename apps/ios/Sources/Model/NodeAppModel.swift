@@ -363,6 +363,14 @@ final class NodeAppModel {
         "\(self.chatTransportModeID)|\(self.chatTranscriptCacheGatewayID ?? "")|\(self.chatTranscriptCacheGeneration)"
     }
 
+    /// Stable owner key for the long-lived chat view model. Connectivity still
+    /// changes `chatViewModelIdentityID` for session-list refreshes, but must
+    /// not rebuild Chat and discard an offline draft on the same gateway.
+    var chatViewModelOwnerID: String {
+        let modeID = self.isLocalGatewayFixtureEnabled ? self.chatTransportModeID : "gateway"
+        return "\(modeID)|\(self.chatTranscriptCacheGatewayID ?? "")|\(self.chatTranscriptCacheGeneration)"
+    }
+
     private var chatTranscriptCacheGeneration = 0
 
     /// Offline transcript cache plus durable command outbox, both scoped to

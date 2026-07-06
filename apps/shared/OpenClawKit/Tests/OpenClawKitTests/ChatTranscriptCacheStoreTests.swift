@@ -421,6 +421,112 @@ struct ChatCommandOutboxStoreTests {
         #expect(await store.loadCommands().isEmpty)
     }
 
+    @Test func `queued cancellation atomically scrubs and suppresses its cached bubble`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-cancel", text: "cancel me")))
+        let staleSnapshot = [
+            cacheMessage(
+                role: "user",
+                text: "cancel me",
+                timestamp: 1,
+                idempotencyKey: "c-cancel:user"),
+            cacheMessage(
+                role: "assistant",
+                text: "newer row",
+                timestamp: 2,
+                idempotencyKey: "other-run"),
+        ]
+        await store.storeTranscript(sessionKey: "main", messages: staleSnapshot)
+
+        #expect(await store.cancelCommand(id: "c-cancel") == .updated)
+        #expect(await messageTexts(store.loadTranscript(sessionKey: "main")) == ["newer row"])
+
+        // An overlapping view can finish a stale whole-transcript write after
+        // cancellation. The cache owner keeps the canceled UUID suppressed.
+        await store.storeTranscript(sessionKey: "main", messages: staleSnapshot)
+        #expect(await messageTexts(store.loadTranscript(sessionKey: "main")) == ["newer row"])
+
+        // Canonical history can prove an ambiguous send really landed. That
+        // authoritative row clears suppression and remains cacheable offline.
+        await store.storeCanonicalTranscript(
+            sessionKey: "main",
+            messages: staleSnapshot,
+            canonicalMessageIdempotencyKeys: ["c-cancel:user"])
+        #expect(await messageTexts(store.loadTranscript(sessionKey: "main")) == ["cancel me", "newer row"])
+
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-canonical-first", text: "already landed")))
+        let canonicalFirst = [cacheMessage(
+            role: "user",
+            text: "already landed",
+            timestamp: 3,
+            idempotencyKey: "c-canonical-first:user")]
+        await store.storeCanonicalTranscript(
+            sessionKey: "main",
+            messages: canonicalFirst,
+            canonicalMessageIdempotencyKeys: ["c-canonical-first:user"])
+        #expect(await store.cancelCommand(id: "c-canonical-first") == .confirmed)
+        #expect(await messageTexts(store.loadTranscript(sessionKey: "main")) == ["already landed"])
+    }
+
+    @Test func `cancellation lookup failure preserves the queued command`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-lookup", text: "keep me")))
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands RENAME TO outbox_commands_unavailable",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        #expect(await store.cancelCommand(id: "c-lookup") == .unavailable)
+
+        raw = nil
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands_unavailable RENAME TO outbox_commands",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+        #expect(await store.loadCommands().map(\.id) == ["c-lookup"])
+    }
+
+    @Test func `transcript lookup failure rolls back queued cancellation`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-cache", text: "keep me")))
+        await store.storeTranscript(
+            sessionKey: "main",
+            messages: [cacheMessage(
+                role: "user",
+                text: "keep me",
+                timestamp: 1,
+                idempotencyKey: "c-cache:user")])
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE cached_transcripts RENAME TO cached_transcripts_unavailable",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        #expect(await store.cancelCommand(id: "c-cache") == .unavailable)
+        #expect(await store.loadCommands().map(\.id) == ["c-cache"])
+    }
+
     @Test func `interrupted sending rows revert to queued on recovery`() async throws {
         let url = try makeDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

@@ -42,6 +42,12 @@ public final class OpenClawChatViewModel {
     public var attachments: [OpenClawPendingAttachment] = []
     /// Setter is module-internal for the health/outbox extension only.
     public internal(set) var healthOK: Bool = false
+
+    /// True when this view model owns a gateway-scoped durable text outbox.
+    public var supportsOfflineTextOutbox: Bool {
+        self.outbox != nil
+    }
+
     public private(set) var pendingRunCount: Int = 0
 
     public private(set) var sessionKey: String
@@ -74,6 +80,10 @@ public final class OpenClawChatViewModel {
     var outboxCommandIDsByMessageID: [UUID: String] = [:]
     @ObservationIgnored
     var outboxMessageIDsByCommandID: [String: UUID] = [:]
+    /// Recent canonical keys let the MainActor resolve proof that arrives
+    /// after SQLite cancellation commits but before its UI continuation runs.
+    @ObservationIgnored
+    var canonicalOutboxMessageKeys: [String] = []
     @ObservationIgnored
     var isFlushingOutbox = false
     @ObservationIgnored
@@ -612,7 +622,10 @@ public final class OpenClawChatViewModel {
         if !preservingOptimisticLocalMessages || !incoming.isEmpty {
             // Persist the reconciled transcript, including durable outbox
             // rows retained while canonical history catches up.
-            self.persistTranscriptToCache(sessionKey: request.session.key, messages: nextMessages)
+            self.persistTranscriptToCache(
+                sessionKey: request.session.key,
+                messages: nextMessages,
+                canonicalMessageIdempotencyKeys: Set(incoming.compactMap(\.idempotencyKey)))
         }
         // Wholesale history replacement drops local-only queued bubbles;
         // re-adopt or re-append them from the durable outbox.
@@ -1012,6 +1025,26 @@ public final class OpenClawChatViewModel {
         return false
     }
 
+    private static func isLiveOnlyLocalSlashCommand(_ command: String) -> Bool {
+        command == "/new" || self.resetTriggers.contains(command) || self.compactTriggers.contains(command)
+    }
+
+    private func prepareLiveOnlyLocalSlashCommand(session: SessionSnapshot) async -> Bool {
+        // Own the async health probe so repeated submits cannot invoke the
+        // same destructive session command twice while connectivity resolves.
+        // Always probe: a preserved view model can retain stale healthy state
+        // after its transport disconnects without a health event.
+        self.isSending = true
+        defer { self.isSending = false }
+        await self.pollHealthIfNeeded(force: true, sessionSnapshot: session)
+        guard self.isCurrentSession(session) else { return false }
+        guard self.healthOK else {
+            self.errorText = "Connect to the gateway to run this command."
+            return false
+        }
+        return true
+    }
+
     private func performSend() async {
         guard !self.isSending else {
             self.logDiagnostic("chat.ui send ignored reason=sending sessionKey=\(self.sessionKey)")
@@ -1030,6 +1063,11 @@ public final class OpenClawChatViewModel {
         }
 
         let command = trimmed.lowercased()
+        let sessionSnapshot = self.currentSessionSnapshot()
+        if Self.isLiveOnlyLocalSlashCommand(command) {
+            let canRunCommand = await self.prepareLiveOnlyLocalSlashCommand(session: sessionSnapshot)
+            guard canRunCommand else { return }
+        }
         if await self.handleLocalSlashCommandIfNeeded(command) {
             return
         }
@@ -1037,7 +1075,6 @@ public final class OpenClawChatViewModel {
             return
         }
 
-        let sessionSnapshot = self.currentSessionSnapshot()
         let sessionKey = sessionSnapshot.key
 
         // Raised before the health poll so the entry guard covers the whole

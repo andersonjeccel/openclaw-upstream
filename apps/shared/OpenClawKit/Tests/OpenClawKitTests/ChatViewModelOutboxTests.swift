@@ -31,7 +31,9 @@ private func userTexts(_ vm: OpenClawChatViewModel) async -> [String] {
 }
 
 private struct OutboxSendError: Error, LocalizedError {
-    var errorDescription: String? { "transport unreachable" }
+    var errorDescription: String? {
+        "transport unreachable"
+    }
 }
 
 private actor OutboxTransportState {
@@ -41,6 +43,7 @@ private actor OutboxTransportState {
     var sendRejects = false
     var sendResponseErrors = false
     var historyFails = false
+    var historyRequestCount = 0
     var heldSendGate: DeleteGate?
     var staleHistoryRows: [AnyCodable]?
 
@@ -51,6 +54,7 @@ private actor OutboxTransportState {
     func setStaleHistoryRows(_ rows: [AnyCodable]?) {
         self.staleHistoryRows = rows
     }
+
     var sentIdempotencyKeys: [String] = []
     var sentMessages: [String] = []
     var sentSessionKeys: [String] = []
@@ -63,6 +67,10 @@ private actor OutboxTransportState {
 
     func setHistoryFails(_ fails: Bool) {
         self.historyFails = fails
+    }
+
+    func recordHistoryRequest() {
+        self.historyRequestCount += 1
     }
 
     func setHealthy(_ healthy: Bool) {
@@ -125,6 +133,7 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
         sessionKey: String,
         expectedRoute: Int?) async throws -> OpenClawChatHistoryPayload
     {
+        await self.state.recordHistoryRequest()
         if let expectedRoute, await self.state.routeGeneration != expectedRoute {
             throw CancellationError()
         }
@@ -431,6 +440,78 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
     }
 }
 
+/// Holds a completed durable cancellation before its result returns to the
+/// MainActor, making late canonical-proof ordering deterministic.
+private actor CancellationHoldingOutbox: OpenClawChatCommandOutbox {
+    private nonisolated let base: OpenClawChatSQLiteTranscriptCache
+    private let canceled = DeleteGate()
+    private let release = DeleteGate()
+
+    init(base: OpenClawChatSQLiteTranscriptCache) {
+        self.base = base
+    }
+
+    func waitUntilCanceled() async {
+        await self.canceled.wait()
+    }
+
+    func releaseCancellation() async {
+        await self.release.open()
+    }
+
+    nonisolated func changes() -> AsyncStream<OpenClawChatOutboxChange> {
+        self.base.changes()
+    }
+
+    func enqueueCommand(_ command: OpenClawChatOutboxCommand) async -> Bool {
+        await self.base.enqueueCommand(command)
+    }
+
+    func loadCommands() async -> [OpenClawChatOutboxCommand] {
+        await self.base.loadCommands()
+    }
+
+    @discardableResult
+    func recoverInterruptedSends() async -> Bool {
+        await self.base.recoverInterruptedSends()
+    }
+
+    func claimNextCommand() async -> OpenClawChatOutboxCommand? {
+        await self.base.claimNextCommand()
+    }
+
+    func markCommandQueued(id: String, retryCount: Int, lastError: String?) async {
+        await self.base.markCommandQueued(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.markCommandAwaitingConfirmation(id: id)
+    }
+
+    func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
+        await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandRetried(id: String) async {
+        await self.base.markCommandRetried(id: id)
+    }
+
+    func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        let result = await self.base.cancelCommand(id: id)
+        await self.canceled.open()
+        await self.release.wait()
+        return result
+    }
+
+    func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.confirmCommand(id: id)
+    }
+
+    func deleteCommand(id: String) async {
+        await self.base.deleteCommand(id: id)
+    }
+}
+
 struct ChatViewModelOutboxTests {
     @Test func `offline send queues durably and renders queued row`() async throws {
         let url = try makeOutboxDatabaseURL()
@@ -438,6 +519,7 @@ struct ChatViewModelOutboxTests {
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
         let transport = OutboxTestTransport(healthy: false)
         let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        #expect(await MainActor.run { vm.supportsOfflineTextOutbox })
 
         await MainActor.run { vm.load() }
         try await sendWhileOffline(vm, text: "hello offline")
@@ -611,6 +693,125 @@ struct ChatViewModelOutboxTests {
         try await waitUntil("canonical history confirms send") {
             await store.loadCommands().isEmpty
         }
+    }
+
+    @Test func `healthy restore reconciles a previously acknowledged turn`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        #expect(await store.enqueueCommand(outboxTestCommand(
+            id: "c-awaiting",
+            text: "already acknowledged",
+            createdAt: Date().timeIntervalSince1970)))
+        #expect(await store.claimNextCommand()?.id == "c-awaiting")
+        #expect(await store.markCommandAwaitingConfirmation(id: "c-awaiting") == .updated)
+
+        let transport = OutboxTestTransport(healthy: true)
+        await transport.state.recordSend(
+            sessionKey: "main",
+            message: "already acknowledged",
+            idempotencyKey: "c-awaiting",
+            thinking: "off")
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run { vm.load() }
+
+        try await waitUntil("restore history confirms acknowledged turn") {
+            await store.loadCommands().isEmpty
+        }
+        #expect(await transport.state.sentMessages == ["already acknowledged"])
+    }
+
+    @Test func `delete race preserves a turn already proven by canonical history`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        #expect(await store.enqueueCommand(outboxTestCommand(
+            id: "c-delivered",
+            text: "delivered already",
+            createdAt: Date().timeIntervalSince1970)))
+        let holdingOutbox = CancellationHoldingOutbox(base: store)
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(
+            transport: transport,
+            outbox: holdingOutbox,
+            transcriptCache: store)
+        await MainActor.run { vm.load() }
+        try await waitUntil("delivered command restored") {
+            await MainActor.run { vm.messages.contains { vm.outboxState(for: $0.id) == .queued } }
+        }
+        let canonicalMessage = OpenClawChatMessage(
+            role: "user",
+            content: [OpenClawChatMessageContent(
+                type: "text",
+                text: "delivered already",
+                mimeType: nil,
+                fileName: nil,
+                content: nil)],
+            timestamp: 1,
+            idempotencyKey: "c-delivered:user")
+        let messageID = try #require(await MainActor.run { vm.messages.last?.id })
+        await MainActor.run { vm.deleteOutboxMessage(messageID) }
+        await holdingOutbox.waitUntilCanceled()
+        // Canonical proof lands after SQLite committed the cancellation but
+        // before its result can remove presentation state on the MainActor.
+        await MainActor.run { vm.confirmOutboxCommands(in: [canonicalMessage]) }
+        await holdingOutbox.releaseCancellation()
+        try await waitUntil("canonical proof wins delete race") {
+            let commandsEmpty = await store.loadCommands().isEmpty
+            let badgeCleared = await MainActor.run { vm.outboxState(for: messageID) == nil }
+            return commandsEmpty && badgeCleared
+        }
+        #expect(await userTexts(vm) == ["delivered already"])
+    }
+
+    @Test func `offline local slash command keeps its draft and skips transport`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run {
+            // A transient transport loss can leave the preserved view model
+            // healthy until the next explicit probe.
+            vm.healthOK = true
+            vm.input = "/new"
+            vm.send()
+        }
+        try await waitUntil("offline slash command rejected") {
+            await MainActor.run { vm.errorText == "Connect to the gateway to run this command." }
+        }
+        #expect(await MainActor.run { vm.input } == "/new")
+        #expect(await store.loadCommands().isEmpty)
+        #expect(await transport.state.sentMessages.isEmpty)
+    }
+
+    @Test func `lagging history does not recursively refresh an acknowledged turn`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        #expect(await store.enqueueCommand(outboxTestCommand(
+            id: "c-lagging",
+            text: "not persisted yet",
+            createdAt: Date().timeIntervalSince1970)))
+        #expect(await store.claimNextCommand()?.id == "c-lagging")
+        #expect(await store.markCommandAwaitingConfirmation(id: "c-lagging") == .updated)
+
+        let transport = OutboxTestTransport(healthy: true)
+        await transport.state.setStaleHistoryRows([])
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run { vm.load() }
+        try await waitUntil("reconnect history request") {
+            await transport.state.historyRequestCount >= 1
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let settledRequestCount = await transport.state.historyRequestCount
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // load() also owns its ordinary visible-session history request. The
+        // exact count can be one or two; neither may trigger a recursive pass.
+        #expect(settledRequestCount <= 2)
+        #expect(await transport.state.historyRequestCount == settledRequestCount)
+        #expect(await store.loadCommands().map(\.status) == [.awaitingConfirmation])
     }
 
     @Test func `gateway rejections burn attempts then fail terminally and support tap retry`() async throws {
@@ -973,7 +1174,7 @@ struct ChatViewModelOutboxTests {
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
         let transport = OutboxTestTransport(healthy: false)
-        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store, transcriptCache: store)
 
         await MainActor.run { vm.load() }
         try await sendWhileOffline(vm, text: "changed my mind")
@@ -981,6 +1182,19 @@ struct ChatViewModelOutboxTests {
         let messageID = try #require(await MainActor.run {
             vm.messages.first { vm.outboxState(for: $0.id) == .queued }?.id
         })
+        let commandID = try #require(await store.loadCommands().first?.id)
+        await store.storeTranscript(
+            sessionKey: "main",
+            messages: [OpenClawChatMessage(
+                role: "user",
+                content: [OpenClawChatMessageContent(
+                    type: "text",
+                    text: "changed my mind",
+                    mimeType: nil,
+                    fileName: nil,
+                    content: nil)],
+                timestamp: 1,
+                idempotencyKey: "\(commandID):user")])
         await MainActor.run { vm.deleteOutboxMessage(messageID) }
 
         // The bubble disappears only after the durable delete lands, so a
@@ -992,6 +1206,16 @@ struct ChatViewModelOutboxTests {
         try await waitUntil("durable row deleted") {
             await store.loadCommands().isEmpty
         }
+        try await waitUntil("canceled bubble removed from transcript cache") {
+            await store.loadTranscript(sessionKey: "main").isEmpty
+        }
+
+        // A later cold open must not repaint the canceled local bubble as an
+        // ordinary sent transcript row after its outbox metadata is gone.
+        let recreated = await makeOutboxViewModel(transport: transport, outbox: store, transcriptCache: store)
+        await MainActor.run { recreated.load() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await userTexts(recreated).isEmpty)
     }
 }
 
@@ -1001,7 +1225,9 @@ private actor DeleteGate {
 
     func open() {
         self.isOpen = true
-        for waiter in self.waiters { waiter.resume() }
+        for waiter in self.waiters {
+            waiter.resume()
+        }
         self.waiters.removeAll()
     }
 

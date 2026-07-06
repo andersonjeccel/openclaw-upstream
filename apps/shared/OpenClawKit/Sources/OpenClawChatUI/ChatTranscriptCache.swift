@@ -49,6 +49,36 @@ private final class OutboxChangeHub: @unchecked Sendable {
     }
 }
 
+/// Canonical gateway evidence must beat a user cancellation synchronously;
+/// actor hops would leave a window where an already-delivered row is scrubbed.
+private final class CanonicalMessageProofHub: @unchecked Sendable {
+    private static let maxKeys = 512
+    private let lock = NSLock()
+    private var keys: [String] = []
+
+    func observe(_ observed: Set<String>) {
+        guard !observed.isEmpty else { return }
+        self.lock.lock()
+        for key in observed.sorted() {
+            self.keys.removeAll(where: { $0 == key })
+            self.keys.append(key)
+        }
+        if self.keys.count > Self.maxKeys {
+            self.keys.removeFirst(self.keys.count - Self.maxKeys)
+        }
+        self.lock.unlock()
+    }
+
+    /// Serializes the final cancellation decision and SQLite commit with
+    /// synchronous canonical observation. Evidence recorded before this lock
+    /// wins; evidence after it observes a completed cancellation.
+    func withProofDecision<T>(for key: String, _ body: (Bool) -> T) -> T {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return body(self.keys.contains(key))
+    }
+}
+
 /// Read-only offline cache seam for chat sessions and transcripts.
 ///
 /// The cache only pre-paints cold opens and covers offline browsing; connected
@@ -60,6 +90,27 @@ public protocol OpenClawChatTranscriptCache: Sendable {
     func loadTranscript(sessionKey: String) async -> [OpenClawChatMessage]
     func storeSessions(_ sessions: [OpenClawChatSessionEntry]) async
     func storeTranscript(sessionKey: String, messages: [OpenClawChatMessage]) async
+    /// Canonical gateway rows can prove that an ambiguously delivered local
+    /// command landed after cancellation and must override local suppression.
+    func storeCanonicalTranscript(
+        sessionKey: String,
+        messages: [OpenClawChatMessage],
+        canonicalMessageIdempotencyKeys: Set<String>) async
+    /// Synchronous observation closes the session.message -> cancellation
+    /// race before asynchronous SQLite confirmation starts.
+    func observeCanonicalMessageIdempotencyKeys(_ keys: Set<String>)
+}
+
+extension OpenClawChatTranscriptCache {
+    public func storeCanonicalTranscript(
+        sessionKey: String,
+        messages: [OpenClawChatMessage],
+        canonicalMessageIdempotencyKeys _: Set<String>) async
+    {
+        await self.storeTranscript(sessionKey: sessionKey, messages: messages)
+    }
+
+    public func observeCanonicalMessageIdempotencyKeys(_: Set<String>) {}
 }
 
 /// One durable queued chat command (text only in v1). `id` is the client UUID
@@ -111,6 +162,7 @@ public struct OpenClawChatOutboxCommand: Hashable, Sendable, Identifiable {
 
 public enum OpenClawChatOutboxUpdateResult: Equatable, Sendable {
     case updated
+    case confirmed
     case missing
     case unavailable
 }
@@ -236,7 +288,11 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     private var db: Connection?
     private var isRetired = false
     private var hasRecoveredInterruptedSends = false
+    /// Process-lifetime tombstones reject stale transcript snapshots from an
+    /// overlapping view model after its queued bubble was canceled durably.
+    private var canceledMessageKeysBySession: [String: [String]] = [:]
     private nonisolated let outboxChangeHub = OutboxChangeHub()
+    private nonisolated let canonicalMessageProofHub = CanonicalMessageProofHub()
     /// Existing database failures preserve persistent outbox bytes and make
     /// this store a no-op; an explicit owner purge remains the recovery path.
     private var isBroken = false
@@ -320,9 +376,36 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     }
 
     public func storeTranscript(sessionKey: String, messages: [OpenClawChatMessage]) async {
+        await self.writeTranscript(sessionKey: sessionKey, messages: messages)
+    }
+
+    public func storeCanonicalTranscript(
+        sessionKey: String,
+        messages: [OpenClawChatMessage],
+        canonicalMessageIdempotencyKeys: Set<String>) async
+    {
+        self.observeCanonicalMessageIdempotencyKeys(canonicalMessageIdempotencyKeys)
+        if !canonicalMessageIdempotencyKeys.isEmpty,
+           var canceledKeys = self.canceledMessageKeysBySession[sessionKey]
+        {
+            canceledKeys.removeAll(where: canonicalMessageIdempotencyKeys.contains)
+            self.canceledMessageKeysBySession[sessionKey] = canceledKeys.isEmpty ? nil : canceledKeys
+        }
+        await self.writeTranscript(sessionKey: sessionKey, messages: messages)
+    }
+
+    public nonisolated func observeCanonicalMessageIdempotencyKeys(_ keys: Set<String>) {
+        self.canonicalMessageProofHub.observe(keys)
+    }
+
+    private func writeTranscript(sessionKey: String, messages: [OpenClawChatMessage]) async {
         guard !self.isRetired else { return }
         guard let db = await self.handle() else { return }
-        let bounded = Self.cacheableMessages(messages)
+        let canceledKeys = self.canceledMessageKeysBySession[sessionKey] ?? []
+        let bounded = Self.cacheableMessages(messages).filter { message in
+            guard let key = message.idempotencyKey else { return true }
+            return !canceledKeys.contains(key)
+        }
         guard !bounded.isEmpty else {
             // An emptied live transcript must also empty the cache, or the next
             // cold open would ghost-paint messages the gateway no longer has.
@@ -426,10 +509,12 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             }
         }
         guard self.applyOutboxStaleness(db) else { return nil }
-        let hasActiveClaim = (self.selectInt(
+        guard let activeClaimCount = self.selectInt(
             db,
             sql: "SELECT COUNT(*) FROM outbox_commands WHERE gateway_id = ?1 AND status = 'sending'",
-            bindings: [self.gatewayID]) ?? 0) > 0
+            bindings: [self.gatewayID])
+        else { return nil }
+        let hasActiveClaim = activeClaimCount > 0
         guard !hasActiveClaim else {
             committed = self.execute(db, sql: "COMMIT", bindings: [])
             return nil
@@ -488,6 +573,34 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
 
     public func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
         guard !self.isRetired, let db = await self.handle() else { return .unavailable }
+        guard self.execute(db, sql: "BEGIN IMMEDIATE", bindings: []) else { return .unavailable }
+        var committed = false
+        defer {
+            if !committed {
+                _ = self.execute(db, sql: "ROLLBACK", bindings: [])
+            }
+        }
+        let messageKey = "\(id):user"
+        let sessionLookup = self.lookupPayload(
+            db,
+            sql: """
+            SELECT session_key FROM outbox_commands
+            WHERE gateway_id = ?1 AND client_uuid = ?2 AND status IN ('queued', 'failed')
+            """,
+            bindings: [self.gatewayID, id])
+        let sessionKey: String
+        switch sessionLookup {
+        case let .value(value):
+            sessionKey = value
+        case .missing:
+            return self.canonicalMessageProofHub.withProofDecision(for: messageKey) { isProven in
+                committed = self.execute(db, sql: "COMMIT", bindings: [])
+                guard committed else { return .unavailable }
+                return isProven ? .confirmed : .missing
+            }
+        case .unavailable:
+            return .unavailable
+        }
         guard self.execute(
             db,
             sql: """
@@ -496,7 +609,29 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             """,
             bindings: [self.gatewayID, id])
         else { return .unavailable }
-        guard sqlite3_changes(db) > 0 else { return .missing }
+        guard sqlite3_changes(db) > 0 else { return .unavailable }
+        let result = self.canonicalMessageProofHub.withProofDecision(for: messageKey) { isProven in
+            if isProven {
+                committed = self.execute(db, sql: "COMMIT", bindings: [])
+                return committed ? OpenClawChatOutboxUpdateResult.confirmed : .unavailable
+            }
+            guard self.removeCachedMessage(
+                db,
+                sessionKey: sessionKey,
+                idempotencyKey: messageKey)
+            else { return .unavailable }
+            committed = self.execute(db, sql: "COMMIT", bindings: [])
+            return committed ? .updated : .unavailable
+        }
+        if result == .confirmed {
+            self.emitOutboxChange(.confirmed(id: id))
+            return .confirmed
+        }
+        guard result == .updated else { return .unavailable }
+        Self.rememberMessageKey(
+            messageKey,
+            sessionKey: sessionKey,
+            storage: &self.canceledMessageKeysBySession)
         self.emitOutboxChange(.canceled(id: id))
         return .updated
     }
@@ -597,6 +732,72 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     private static func encodeJSON(_ value: some Encodable) -> String? {
         guard let data = try? JSONEncoder().encode(value) else { return nil }
         return String(bytes: data, encoding: .utf8)
+    }
+
+    private static func rememberMessageKey(
+        _ key: String,
+        sessionKey: String,
+        storage: inout [String: [String]])
+    {
+        var keys = storage[sessionKey] ?? []
+        keys.removeAll(where: { $0 == key })
+        keys.append(key)
+        if keys.count > Self.maxCachedMessagesPerSession {
+            keys.removeFirst(keys.count - Self.maxCachedMessagesPerSession)
+        }
+        storage[sessionKey] = keys
+        if storage.count > Self.maxCachedTranscripts,
+           let evictedSession = storage.keys.first(where: { $0 != sessionKey })
+        {
+            storage.removeValue(forKey: evictedSession)
+        }
+    }
+
+    /// Runs inside the outbox cancellation transaction, so a process exit can
+    /// never leave a deleted command behind as an ordinary cached sent row.
+    private func removeCachedMessage(
+        _ db: OpaquePointer,
+        sessionKey: String,
+        idempotencyKey: String) -> Bool
+    {
+        let transcriptLookup = self.lookupPayload(
+            db,
+            sql: "SELECT payload FROM cached_transcripts WHERE gateway_id = ?1 AND session_key = ?2",
+            bindings: [self.gatewayID, sessionKey])
+        let payload: String
+        switch transcriptLookup {
+        case let .value(value):
+            payload = value
+        case .missing:
+            return true
+        case .unavailable:
+            return false
+        }
+        guard let decoded = try? JSONDecoder().decode(
+            [OpenClawChatMessage].self,
+            from: Data(payload.utf8))
+        else {
+            return self.execute(
+                db,
+                sql: "DELETE FROM cached_transcripts WHERE gateway_id = ?1 AND session_key = ?2",
+                bindings: [self.gatewayID, sessionKey])
+        }
+        let filtered = decoded.filter { $0.idempotencyKey != idempotencyKey }
+        guard filtered.count != decoded.count else { return true }
+        guard !filtered.isEmpty else {
+            return self.execute(
+                db,
+                sql: "DELETE FROM cached_transcripts WHERE gateway_id = ?1 AND session_key = ?2",
+                bindings: [self.gatewayID, sessionKey])
+        }
+        guard let filteredPayload = Self.encodeJSON(filtered) else { return false }
+        return self.execute(
+            db,
+            sql: """
+            UPDATE cached_transcripts SET payload = ?3, updated_at = ?4
+            WHERE gateway_id = ?1 AND session_key = ?2
+            """,
+            bindings: [self.gatewayID, sessionKey, filteredPayload, Date().timeIntervalSince1970])
     }
 
     // MARK: - Connection lifecycle
@@ -805,14 +1006,33 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         return commands
     }
 
-    private func selectPayload(_ db: OpaquePointer, sql: String, bindings: [Any]) -> String? {
+    private enum PayloadLookup {
+        case value(String)
+        case missing
+        case unavailable
+    }
+
+    private func lookupPayload(_ db: OpaquePointer, sql: String, bindings: [Any]) -> PayloadLookup {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return .unavailable }
         defer { sqlite3_finalize(statement) }
-        guard self.bind(statement, bindings: bindings) else { return nil }
-        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
-        guard let text = sqlite3_column_text(statement, 0) else { return nil }
-        return String(cString: text)
+        guard self.bind(statement, bindings: bindings) else { return .unavailable }
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            guard let text = sqlite3_column_text(statement, 0) else { return .unavailable }
+            return .value(String(cString: text))
+        case SQLITE_DONE:
+            return .missing
+        default:
+            return .unavailable
+        }
+    }
+
+    private func selectPayload(_ db: OpaquePointer, sql: String, bindings: [Any]) -> String? {
+        guard case let .value(payload) = self.lookupPayload(db, sql: sql, bindings: bindings) else {
+            return nil
+        }
+        return payload
     }
 
     private func bind(_ statement: OpaquePointer?, bindings: [Any]) -> Bool {
