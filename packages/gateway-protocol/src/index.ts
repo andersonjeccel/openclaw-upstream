@@ -47,6 +47,18 @@ import {
   AgentsFilesSetParamsSchema,
   type AgentsFilesSetResult,
   AgentsFilesSetResultSchema,
+  type AgentsWorkspaceEntry,
+  AgentsWorkspaceEntrySchema,
+  type AgentsWorkspaceFile,
+  AgentsWorkspaceFileSchema,
+  type AgentsWorkspaceGetParams,
+  AgentsWorkspaceGetParamsSchema,
+  type AgentsWorkspaceGetResult,
+  AgentsWorkspaceGetResultSchema,
+  type AgentsWorkspaceListParams,
+  AgentsWorkspaceListParamsSchema,
+  type AgentsWorkspaceListResult,
+  AgentsWorkspaceListResultSchema,
   type ArtifactsDownloadParams,
   ArtifactsDownloadParamsSchema,
   type ArtifactsDownloadResult,
@@ -662,6 +674,12 @@ export const validateAgentsFilesGetParams = lazyCompile<AgentsFilesGetParams>(
 export const validateAgentsFilesSetParams = lazyCompile<AgentsFilesSetParams>(
   AgentsFilesSetParamsSchema,
 );
+export const validateAgentsWorkspaceListParams = lazyCompile<AgentsWorkspaceListParams>(
+  AgentsWorkspaceListParamsSchema,
+);
+export const validateAgentsWorkspaceGetParams = lazyCompile<AgentsWorkspaceGetParams>(
+  AgentsWorkspaceGetParamsSchema,
+);
 export const validateArtifactsListParams =
   lazyCompile<ArtifactsListParams>(ArtifactsListParamsSchema);
 export const validateArtifactsGetParams = lazyCompile<ArtifactsGetParams>(ArtifactsGetParamsSchema);
@@ -1257,6 +1275,12 @@ export {
   AgentsFilesGetResultSchema,
   AgentsFilesSetParamsSchema,
   AgentsFilesSetResultSchema,
+  AgentsWorkspaceEntrySchema,
+  AgentsWorkspaceFileSchema,
+  AgentsWorkspaceListParamsSchema,
+  AgentsWorkspaceListResultSchema,
+  AgentsWorkspaceGetParamsSchema,
+  AgentsWorkspaceGetResultSchema,
   AgentsListParamsSchema,
   AgentsListResultSchema,
   CommandsListParamsSchema,
@@ -1447,6 +1471,12 @@ export type {
   AgentsFilesGetResult,
   AgentsFilesSetParams,
   AgentsFilesSetResult,
+  AgentsWorkspaceEntry,
+  AgentsWorkspaceFile,
+  AgentsWorkspaceListParams,
+  AgentsWorkspaceListResult,
+  AgentsWorkspaceGetParams,
+  AgentsWorkspaceGetResult,
   SessionFileBrowserEntry,
   SessionFileBrowserResult,
   SessionFileEntry,
