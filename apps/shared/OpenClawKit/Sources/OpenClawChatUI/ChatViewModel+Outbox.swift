@@ -721,7 +721,13 @@ extension OpenClawChatViewModel {
         // Migrated v2 aliases have no owner and are parked as failed. Show
         // them so explicit retry can adopt the currently selected agent.
         guard let commandAgentID = command.agentID else { return true }
-        return commandAgentID == self.outboxAgentID(for: session)
+        guard let currentAgentID = self.outboxAgentID(for: session) else {
+            // Cold offline launch has not recovered gateway ownership yet.
+            // Keep the durable turn visible; the route lease verifies its
+            // captured owner and contract before any later delivery.
+            return true
+        }
+        return commandAgentID == currentAgentID
     }
 
     private func setOutboxState(_ state: OpenClawChatOutboxMessageState, forCommandID commandID: String) {

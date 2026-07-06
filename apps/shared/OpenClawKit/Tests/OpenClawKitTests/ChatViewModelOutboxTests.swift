@@ -759,6 +759,24 @@ struct ChatViewModelOutboxTests {
             }
         }
         #expect(await userTexts(vm2) == ["hello offline"])
+
+        // A cold launch can restore before the gateway provides its default
+        // agent. The captured owner still keeps the bubble visible; replay
+        // remains blocked on the route lease's owner/contract verification.
+        let ownerlessColdOpen = await makeOutboxViewModel(
+            transport: transport,
+            outbox: store,
+            activeAgentID: nil,
+            sessionRoutingContract: nil)
+        await MainActor.run { ownerlessColdOpen.load() }
+        try await waitUntil("ownerless cold open restores queued bubble") {
+            await MainActor.run {
+                ownerlessColdOpen.messages.contains {
+                    ownerlessColdOpen.outboxState(for: $0.id) == .queued
+                }
+            }
+        }
+        #expect(await userTexts(ownerlessColdOpen) == ["hello offline"])
     }
 
     @Test func `unsupported gateway keeps queued work and surfaces upgrade action`() async throws {
