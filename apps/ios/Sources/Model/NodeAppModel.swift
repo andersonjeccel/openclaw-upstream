@@ -3138,6 +3138,9 @@ extension NodeAppModel {
                         password: reconnectAuth.password,
                         connectOptions: operatorOptions,
                         sessionBox: sessionBox,
+                        extraHeadersProvider: {
+                            GatewaySettingsStore.loadGatewayCustomHeaders(gatewayStableID: stableID)
+                        },
                         onConnected: { [weak self] in
                             await self?.handleOperatorGatewayConnected(
                                 url: url,
@@ -3280,6 +3283,9 @@ extension NodeAppModel {
                         password: reconnectAuth.password,
                         connectOptions: connectedOptions,
                         sessionBox: sessionBox,
+                        extraHeadersProvider: {
+                            GatewaySettingsStore.loadGatewayCustomHeaders(gatewayStableID: stableID)
+                        },
                         onConnected: { [weak self] in
                             await self?.handleNodeGatewayConnected(
                                 url: url,
