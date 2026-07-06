@@ -77,6 +77,22 @@ private func outboxCommand(
 }
 
 struct ChatTranscriptCacheStoreTests {
+    @Test func `verified routing identity survives a cold store reopen`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let identity = try #require(OpenClawChatSessionRoutingIdentity(
+            scope: " Per-Sender ",
+            mainSessionKey: " Work ",
+            defaultAgentID: " Main "))
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+
+        await store.storeSessionRoutingIdentity(identity)
+
+        let reopened = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await reopened.loadSessionRoutingIdentity() == identity)
+        #expect(identity.contract == "per-sender|work|main")
+    }
+
     @Test func `transcript and sessions round trip`() async throws {
         let url = try makeDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -566,6 +582,32 @@ struct ChatTranscriptCacheStoreTests {
             OpenClawChatSQLiteTranscriptCache.outboxUnknownTargetError,
             OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError,
         ])
+    }
+
+    @Test func `v4 migration adds routing identity without touching outbox`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        do {
+            let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+            #expect(await store.enqueueCommand(outboxCommand(id: "c-v4", text: "preserve me")))
+            await store.retire()
+        }
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "DROP TABLE gateway_routing_identity", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "PRAGMA user_version = 4", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        let migrated = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await migrated.loadCommands().map(\.id) == ["c-v4"])
+        #expect(await migrated.loadSessionRoutingIdentity() == nil)
+        let identity = try #require(OpenClawChatSessionRoutingIdentity(
+            scope: "global",
+            mainSessionKey: "main",
+            defaultAgentID: "main"))
+        await migrated.storeSessionRoutingIdentity(identity)
+        #expect(await migrated.loadSessionRoutingIdentity() == identity)
     }
 
     @Test func `unknown schema preserves durable outbox bytes and fails closed`() async throws {

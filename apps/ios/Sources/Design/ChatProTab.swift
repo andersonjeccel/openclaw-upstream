@@ -50,6 +50,7 @@ struct ChatProTab: View {
             }
         }
         .task {
+            await self.appModel.restoreChatSessionRoutingIdentityIfNeeded()
             self.syncChatViewModel()
         }
         .onChange(of: self.appModel.chatSessionKey) { _, _ in
@@ -136,7 +137,7 @@ struct ChatProTab: View {
                 assistantAvatarTint: OpenClawBrand.accent,
                 showsAssistantAvatars: false,
                 composerChrome: .clean,
-                isComposerEnabled: self.gatewayConnected || viewModel.supportsOfflineTextOutbox,
+                isComposerEnabled: self.gatewayConnected || self.canQueueOffline,
                 isAttachmentInputEnabled: self.gatewayConnected,
                 messagePlaceholder: self.messagePlaceholder,
                 emptyAssistantIntro: String(localized: "What would you like to work on?"),
@@ -379,10 +380,15 @@ struct ChatProTab: View {
         if self.gatewayConnected {
             return String(localized: "Message \(self.agentDisplayName)...")
         }
-        if self.viewModel?.supportsOfflineTextOutbox == true {
+        if self.canQueueOffline {
             return String(localized: "Message \(self.agentDisplayName); sends when connected")
         }
         return String(localized: "Connect to a gateway")
+    }
+
+    private var canQueueOffline: Bool {
+        self.viewModel?.supportsOfflineTextOutbox == true &&
+            self.appModel.hasVerifiedChatOfflineRoutingIdentity
     }
 
     private var headerDisplayTitle: String {

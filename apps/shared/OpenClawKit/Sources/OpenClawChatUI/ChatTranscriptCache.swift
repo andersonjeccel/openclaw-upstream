@@ -332,6 +332,27 @@ extension OpenClawChatCommandOutbox {
     }
 }
 
+public struct OpenClawChatSessionRoutingIdentity: Equatable, Sendable {
+    public let scope: String
+    public let mainSessionKey: String
+    public let defaultAgentID: String
+    public let contract: String
+
+    public init?(scope: String?, mainSessionKey: String?, defaultAgentID: String?) {
+        guard let contract = OpenClawChatSessionRoutingContract.make(
+            scope: scope,
+            mainKey: mainSessionKey,
+            defaultAgentID: defaultAgentID)
+        else { return nil }
+        let parts = contract.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        self.scope = String(parts[0])
+        self.mainSessionKey = String(parts[1])
+        self.defaultAgentID = String(parts[2])
+        self.contract = contract
+    }
+}
+
 /// SQLite-backed transcript cache for one gateway identity. Owners should use
 /// one database file per gateway so reset can physically remove that gateway's
 /// cached transcript bytes without disturbing other paired gateways; queries
@@ -356,8 +377,8 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     public static let outboxUnknownTargetError = "delivery_target_unknown"
     public static let outboxChangedTargetError = "delivery_target_changed"
     // v2 adds the durable outbox; v3 adds delivery ownership; v4 binds
-    // replay to the gateway's main-routing contract.
-    static let schemaVersion: Int32 = 4
+    // replay to the main-routing contract; v5 persists that verified identity.
+    static let schemaVersion: Int32 = 5
     private static let createOutboxTableSQL = """
     CREATE TABLE IF NOT EXISTS outbox_commands(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -383,6 +404,15 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         payload TEXT NOT NULL,
         updated_at REAL NOT NULL,
         PRIMARY KEY(gateway_id, session_key, agent_id)
+    )
+    """
+    private static let createRoutingIdentityTableSQL = """
+    CREATE TABLE IF NOT EXISTS gateway_routing_identity(
+        gateway_id TEXT NOT NULL PRIMARY KEY,
+        scope TEXT NOT NULL,
+        main_session_key TEXT NOT NULL,
+        default_agent_id TEXT NOT NULL,
+        updated_at REAL NOT NULL
     )
     """
 
@@ -501,6 +531,45 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             VALUES (?1, ?2, ?3)
             """,
             bindings: [self.gatewayID, payload, Date().timeIntervalSince1970])
+    }
+
+    public func loadSessionRoutingIdentity() async -> OpenClawChatSessionRoutingIdentity? {
+        guard !self.isRetired, let db = await handle() else { return nil }
+        var statement: OpaquePointer?
+        let sql = """
+        SELECT scope, main_session_key, default_agent_id
+        FROM gateway_routing_identity WHERE gateway_id = ?1
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard self.bind(statement, bindings: [self.gatewayID]),
+              sqlite3_step(statement) == SQLITE_ROW,
+              let scope = sqlite3_column_text(statement, 0),
+              let mainSessionKey = sqlite3_column_text(statement, 1),
+              let defaultAgentID = sqlite3_column_text(statement, 2)
+        else { return nil }
+        return OpenClawChatSessionRoutingIdentity(
+            scope: String(cString: scope),
+            mainSessionKey: String(cString: mainSessionKey),
+            defaultAgentID: String(cString: defaultAgentID))
+    }
+
+    public func storeSessionRoutingIdentity(_ identity: OpenClawChatSessionRoutingIdentity) async {
+        guard !self.isRetired, let db = await handle() else { return }
+        self.execute(
+            db,
+            sql: """
+            INSERT OR REPLACE INTO gateway_routing_identity(
+                gateway_id, scope, main_session_key, default_agent_id, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            """,
+            bindings: [
+                self.gatewayID,
+                identity.scope,
+                identity.mainSessionKey,
+                identity.defaultAgentID,
+                Date().timeIntervalSince1970,
+            ])
     }
 
     public func storeTranscript(sessionKey: String, messages: [OpenClawChatMessage]) async {
@@ -1198,6 +1267,11 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
                 sqlite3_close_v2(opened)
                 return nil
             }
+        } else if version == 4 {
+            guard self.migrateSchemaFromV4(opened) else {
+                sqlite3_close_v2(opened)
+                return nil
+            }
         } else if version != Self.schemaVersion {
             // Unknown schemas may contain outbox rows from a newer build.
             // The caller preserves the file and fails closed.
@@ -1234,6 +1308,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             """,
             Self.createTranscriptTableSQL,
             Self.createOutboxTableSQL,
+            Self.createRoutingIdentityTableSQL,
             "PRAGMA user_version = \(Self.schemaVersion)",
         ]
         for sql in statements {
@@ -1252,6 +1327,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         }
         guard self.migrateTranscriptTableToV3(db),
               sqlite3_exec(db, Self.createOutboxTableSQL, nil, nil, nil) == SQLITE_OK,
+              sqlite3_exec(db, Self.createRoutingIdentityTableSQL, nil, nil, nil) == SQLITE_OK,
               sqlite3_exec(db, "PRAGMA user_version = \(Self.schemaVersion)", nil, nil, nil) == SQLITE_OK,
               sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK
         else {
@@ -1305,6 +1381,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
                       delivery_session_key = '', routing_contract = ''
                   """,
                   bindings: [Self.outboxUnknownTargetError, Self.outboxUnconfirmedError]),
+              sqlite3_exec(db, Self.createRoutingIdentityTableSQL, nil, nil, nil) == SQLITE_OK,
               sqlite3_exec(db, "PRAGMA user_version = \(Self.schemaVersion)", nil, nil, nil) == SQLITE_OK,
               sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK
         else {
@@ -1342,8 +1419,25 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
                     delivery_session_key = '', routing_contract = ''
                 """,
                 bindings: [Self.outboxUnknownTargetError, Self.outboxUnconfirmedError]),
+            sqlite3_exec(db, Self.createRoutingIdentityTableSQL, nil, nil, nil) == SQLITE_OK,
             sqlite3_exec(db, "PRAGMA user_version = \(Self.schemaVersion)", nil, nil, nil) == SQLITE_OK,
             sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK
+        else { return false }
+        committed = true
+        return true
+    }
+
+    private func migrateSchemaFromV4(_ db: OpaquePointer) -> Bool {
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+        var committed = false
+        defer {
+            if !committed {
+                sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            }
+        }
+        guard sqlite3_exec(db, Self.createRoutingIdentityTableSQL, nil, nil, nil) == SQLITE_OK,
+              sqlite3_exec(db, "PRAGMA user_version = \(Self.schemaVersion)", nil, nil, nil) == SQLITE_OK,
+              sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK
         else { return false }
         committed = true
         return true

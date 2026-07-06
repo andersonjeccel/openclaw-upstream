@@ -351,6 +351,7 @@ final class NodeAppModel {
     var chatTranscriptCacheGatewayID: String? {
         guard !self.isLocalGatewayFixtureEnabled else { return nil }
         let stableID = self.activeGatewayConnectConfig?.effectiveStableID
+            ?? self.connectedGatewayID
             ?? GatewaySettingsStore.loadLastGatewayConnection()?.stableID
         guard let stableID, !stableID.isEmpty else { return nil }
         return stableID
@@ -387,6 +388,28 @@ final class NodeAppModel {
         let cache = OpenClawChatSQLiteTranscriptCache(databaseURL: databaseURL, gatewayID: gatewayID)
         self.chatTranscriptCachesByGatewayID[gatewayID] = cache
         return cache
+    }
+
+    var hasVerifiedChatOfflineRoutingIdentity: Bool {
+        self.chatTranscriptCacheGatewayID != nil &&
+            self.chatDeliveryAgentId != nil &&
+            self.chatSessionRoutingContract != nil
+    }
+
+    func restoreChatSessionRoutingIdentityIfNeeded() async {
+        guard !self.isLocalGatewayFixtureEnabled,
+              self.chatSessionRoutingContract == nil,
+              let store = self.makeChatOfflineStore(),
+              let identity = await store.loadSessionRoutingIdentity(),
+              self.chatTranscriptCacheGatewayID == store.gatewayID,
+              self.chatSessionRoutingContract == nil
+        else { return }
+        self.selectedAgentId = GatewaySettingsStore.loadGatewaySelectedAgentId(stableID: store.gatewayID)
+        self.gatewaySessionScope = identity.scope
+        self.mainSessionBaseKey = identity.mainSessionKey
+        self.gatewayDefaultAgentId = identity.defaultAgentID
+        self.talkMode.updateMainSessionKey(self.mainSessionKey)
+        self.homeCanvasRevision &+= 1
     }
 
     func loadCachedChatSessions() async -> [OpenClawChatSessionEntry] {
@@ -1016,13 +1039,20 @@ final class NodeAppModel {
 
     private func refreshBrandingFromGateway(shouldApply: () -> Bool = { true }) async {
         do {
-            let res = try await operatorGateway.request(method: "config.get", paramsJSON: "{}", timeoutSeconds: 8)
+            guard let sourceGatewayID = self.chatTranscriptCacheGatewayID,
+                  let sourceRoute = await operatorGateway.currentRoute(ifGatewayID: sourceGatewayID)
+            else { return }
+            let res = try await operatorGateway.request(
+                method: "config.get",
+                paramsJSON: "{}",
+                timeoutSeconds: 8,
+                ifCurrentRoute: sourceRoute)
             guard let json = try JSONSerialization.jsonObject(with: res) as? [String: Any] else { return }
             guard let config = json["config"] as? [String: Any] else { return }
             let session = config["session"] as? [String: Any]
             let mainKey = SessionKey.normalizeMainKey(session?["mainKey"] as? String)
             let scope = (session?["scope"] as? String) ?? "per-sender"
-            guard shouldApply() else { return }
+            guard shouldApply(), self.chatTranscriptCacheGatewayID == sourceGatewayID else { return }
             await MainActor.run {
                 self.mainSessionBaseKey = mainKey
                 self.gatewaySessionScope = scope
@@ -1042,9 +1072,22 @@ final class NodeAppModel {
 
     private func refreshAgentsFromGateway(shouldApply: () -> Bool = { true }) async {
         do {
-            let res = try await operatorGateway.request(method: "agents.list", paramsJSON: "{}", timeoutSeconds: 8)
+            guard let sourceGatewayID = self.chatTranscriptCacheGatewayID,
+                  let sourceStore = self.makeChatOfflineStore(),
+                  sourceStore.gatewayID == sourceGatewayID,
+                  let sourceRoute = await operatorGateway.currentRoute(ifGatewayID: sourceGatewayID)
+            else { return }
+            let res = try await operatorGateway.request(
+                method: "agents.list",
+                paramsJSON: "{}",
+                timeoutSeconds: 8,
+                ifCurrentRoute: sourceRoute)
             let decoded = try JSONDecoder().decode(AgentsListResult.self, from: res)
-            guard shouldApply() else { return }
+            let routingIdentity = OpenClawChatSessionRoutingIdentity(
+                scope: decoded.scope.value as? String,
+                mainSessionKey: decoded.mainkey,
+                defaultAgentID: decoded.defaultid)
+            guard shouldApply(), self.chatTranscriptCacheGatewayID == sourceGatewayID else { return }
             await MainActor.run {
                 self.gatewayDefaultAgentId = decoded.defaultid
                 self.gatewayAgents = decoded.agents
@@ -1058,6 +1101,9 @@ final class NodeAppModel {
                 }
                 self.talkMode.updateMainSessionKey(self.mainSessionKey)
                 self.homeCanvasRevision &+= 1
+            }
+            if let routingIdentity {
+                await sourceStore.storeSessionRoutingIdentity(routingIdentity)
             }
         } catch {
             // Best-effort only.
@@ -2669,8 +2715,6 @@ extension NodeAppModel {
         self.gatewayConnected = false
         setOperatorConnected(false)
         self.talkMode.updateGatewayConnected(false)
-        self.mainSessionBaseKey = "main"
-        self.gatewaySessionScope = nil
         self.talkMode.updateMainSessionKey(self.mainSessionKey)
         ShareGatewayRelaySettings.clearConfig()
         showLocalCanvasOnDisconnect()
@@ -2726,6 +2770,9 @@ extension NodeAppModel {
         self.focusedChatSessionKey = nil
         self.homeCanvasRevision &+= 1
         self.apnsLastRegisteredTokenHex = nil
+        Task { [weak self] in
+            await self?.restoreChatSessionRoutingIdentityIfNeeded()
+        }
     }
 
     private func clearGatewayConnectionProblem() {
