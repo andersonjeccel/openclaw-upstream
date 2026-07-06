@@ -16,6 +16,7 @@ Availability: iPhone app builds are distributed through Apple channels when enab
 - Receives `node.invoke` commands and reports node status events.
 - Keeps a small read-only offline cache of recent chat sessions and transcripts per paired gateway: cold opens paint the last known transcript immediately and refresh once the gateway responds, recent chats stay browsable while disconnected, and reset/forget purges the protected local cache.
 - Queues text messages sent while disconnected in a durable per-gateway outbox (up to 50): queued bubbles show in the transcript, flush in order on reconnect with idempotency keys so nothing sends twice, retry with backoff before surfacing as "Not sent" with retry/delete in the message context menu, and expire instead of sending after 48 hours offline; reset/forget clears the queue with the cache.
+- Speaks assistant messages on demand: long-press a message in Chat and choose **Listen**. Audio renders through the gateway `tts.speak` method with the configured TTS provider; when the gateway cannot render audio, the app falls back to on-device speech synthesis. Playback stops on session switch or backgrounding.
 
 ## Requirements
 
