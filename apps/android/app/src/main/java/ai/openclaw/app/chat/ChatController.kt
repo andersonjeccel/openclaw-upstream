@@ -71,6 +71,7 @@ class ChatController internal constructor(
   // True while the transcript shown came from the offline cache and no live history replaced it yet.
   private val _messagesFromCache = MutableStateFlow(false)
   val messagesFromCache: StateFlow<Boolean> = _messagesFromCache.asStateFlow()
+  private var liveHistoryLoadedSessionKey: String? = null
 
   private val _historyLoading = MutableStateFlow(false)
   val historyLoading: StateFlow<Boolean> = _historyLoading.asStateFlow()
@@ -179,6 +180,7 @@ class ChatController internal constructor(
     updateErrorText(null)
     _commands.value = emptyList()
     commandsAgentId = null
+    liveHistoryLoadedSessionKey = null
     synchronized(pendingRuns) {
       disconnectedPendingRunIds.addAll(pendingRuns)
     }
@@ -213,6 +215,7 @@ class ChatController internal constructor(
         clearMessages = true,
         markLoading = false,
       )
+      liveHistoryLoadedSessionKey = null
       _sessions.value = emptyList()
       sessionsListArchived = false
       unreadPatchSessionKey = null
@@ -235,6 +238,12 @@ class ChatController internal constructor(
   fun load(sessionKey: String) {
     val key = normalizeRequestedSessionKey(sessionKey)
     if (key == _sessionKey.value) {
+      val hasCurrentLiveHistory =
+        liveHistoryLoadedSessionKey == key &&
+          !_messagesFromCache.value &&
+          _errorText.value == null &&
+          _healthOk.value
+      if (hasCurrentLiveHistory) return
       refresh()
       return
     }
@@ -458,6 +467,7 @@ class ChatController internal constructor(
     }
     updateErrorText(null)
     _healthOk.value = false
+    liveHistoryLoadedSessionKey = null
     clearPendingRuns()
     pendingToolCallsById.clear()
     publishPendingToolCalls()
@@ -865,6 +875,7 @@ class ChatController internal constructor(
         _messagesFromCache.value = false
         _messages.value = mergeOptimisticMessages(incoming = history.messages, optimistic = optimisticMessagesByRunId.values)
         _sessionId.value = history.sessionId
+        liveHistoryLoadedSessionKey = sessionKey
         _historyLoading.value = false
         if (historyLoadErrorGeneration == generation) {
           updateErrorText(null)

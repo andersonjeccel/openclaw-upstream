@@ -618,7 +618,7 @@ private fun ChatMessageList(
     }
 
     if (timeline.items.isEmpty()) {
-      if (historyLoading) {
+      if (showChatLoadingPlaceholder(historyLoading = historyLoading, healthOk = healthOk, gatewayOffline = gatewayOffline)) {
         ClawLoadingState(title = "Loading session", modifier = Modifier.align(Alignment.Center))
       } else {
         EmptyChatHint(
@@ -652,6 +652,12 @@ private fun ChatMessageList(
     }
   }
 }
+
+internal fun showChatLoadingPlaceholder(
+  historyLoading: Boolean,
+  healthOk: Boolean,
+  gatewayOffline: Boolean,
+): Boolean = historyLoading && !healthOk && !gatewayOffline
 
 @Composable
 private fun EmptyChatHint(
