@@ -145,7 +145,17 @@ class NodeForegroundService : Service() {
     title: String,
     text: String,
   ): Notification {
-    val launchPending = mainActivityPendingIntent(this, requestCode = 1)
+    val launchIntent =
+      Intent(this, MainActivity::class.java).apply {
+        flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+      }
+    val launchPending =
+      PendingIntent.getActivity(
+        this,
+        1,
+        launchIntent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      )
 
     val stopIntent = Intent(this, NodeForegroundService::class.java).setAction(ACTION_STOP)
     val stopPending =

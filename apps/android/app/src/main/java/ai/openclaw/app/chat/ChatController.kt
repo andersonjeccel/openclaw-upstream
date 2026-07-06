@@ -37,6 +37,8 @@ class ChatController internal constructor(
   private val scope: CoroutineScope,
   private val json: Json,
   private val requestGateway: suspend (method: String, paramsJson: String?) -> String,
+  private val requestGatewayForGateway: suspend (gatewayId: String, method: String, paramsJson: String?) -> String =
+    { _, method, paramsJson -> requestGateway(method, paramsJson) },
   private val transcriptCache: ChatTranscriptCache? = null,
   private val cacheScope: () -> ChatCacheScope? = { null },
   private val commandOutbox: ChatCommandOutbox? = null,
@@ -52,6 +54,9 @@ class ChatController internal constructor(
     scope = scope,
     json = json,
     requestGateway = { method, paramsJson -> session.request(method, paramsJson) },
+    requestGatewayForGateway = { gatewayId, method, paramsJson ->
+      session.requestForEndpoint(gatewayId, method, paramsJson)
+    },
     transcriptCache = transcriptCache,
     cacheScope = cacheScope,
     commandOutbox = commandOutbox,
@@ -120,7 +125,6 @@ class ChatController internal constructor(
   // Drops stale history responses after session switches or refresh races.
   private val historyLoadGeneration = AtomicLong(0)
   private val historyRequestSequence = AtomicLong(0)
-  private val sessionsRequestSequence = AtomicLong(0)
   private val gatewayScopeApplyLock = Any()
   private var latestAppliedHistoryRequest = 0L
   private var latestAppliedInFlightRunId: String? = null
@@ -130,13 +134,6 @@ class ChatController internal constructor(
 
   private var lastHealthPollAtMs: Long? = null
   private var commandsAgentId: String? = null
-  private var sessionsListArchived = false
-
-  // One acknowledgement per unread episode: the pending flag clears when the
-  // server-confirmed read (unread=false) arrives, so fresh activity on the open
-  // session re-acknowledges without patch loops (lastReadAt is stamped server-side).
-  private var unreadPatchSessionKey: String? = null
-  private var unreadPatchRequested = false
 
   // Armed on disconnect so the next health event refetches history and re-adopts
   // any run the gateway still reports in flight (chat.history `inFlightRun`).
@@ -206,20 +203,34 @@ class ChatController internal constructor(
   }
 
   /** Invalidates and clears gateway-bound UI state before a target switch can race old responses. */
-  fun onGatewayScopeChanging() {
+  fun onGatewayScopeChanging(retireRunState: Boolean = false) {
     synchronized(gatewayScopeApplyLock) {
+      if (retireRunState) {
+        restoreRunStateOnReconnect = false
+        clearPendingRuns()
+        pendingToolCallsById.clear()
+        publishPendingToolCalls()
+        _streamingAssistantText.value = null
+      }
+      appliedMainSessionKey = "main"
       beginHistoryLoad(
-        key = normalizeRequestedSessionKey(_sessionKey.value),
+        key = "main",
         clearMessages = true,
         markLoading = false,
       )
       _sessions.value = emptyList()
-      sessionsListArchived = false
-      unreadPatchSessionKey = null
-      unreadPatchRequested = false
+      _commands.value = emptyList()
+      commandsAgentId = null
+      lastHealthPollAtMs = null
       // Outbox rows are gateway-scoped too; the next publish repopulates them for the new scope.
       _outboxItems.value = emptyList()
     }
+  }
+
+  /** Restores the selected gateway's local state without waiting for transport availability. */
+  fun restoreSelectedGatewayOfflineState() {
+    refresh()
+    scope.launch { publishOutbox() }
   }
 
   /** Purges cached transcripts and queued sends after old-scope writes finish. */
@@ -228,6 +239,14 @@ class ChatController internal constructor(
     cacheMutationMutex.withLock {
       cache.clearAll()
       commandOutbox?.clearAll()
+    }
+  }
+
+  /** Purges cached transcripts and queued sends for one retired authentication scope. */
+  internal suspend fun clearGatewayCache(gatewayId: String) {
+    cacheMutationMutex.withLock {
+      transcriptCache?.clearGateway(gatewayId)
+      commandOutbox?.clearGateway(gatewayId)
     }
   }
 
@@ -273,97 +292,8 @@ class ChatController internal constructor(
     refreshHistoryForRecovery(forceHealth = true)
   }
 
-  fun refreshSessions(
-    limit: Int? = null,
-    archived: Boolean = false,
-  ) {
-    scope.launch { fetchSessions(limit = limit, archived = archived) }
-  }
-
-  suspend fun patchSession(
-    key: String,
-    label: String? = null,
-    clearLabel: Boolean = false,
-    category: String? = null,
-    clearCategory: Boolean = false,
-    pinned: Boolean? = null,
-    archived: Boolean? = null,
-    unread: Boolean? = null,
-  ): Boolean {
-    val sessionKey = key.trim().takeIf { it.isNotEmpty() } ?: return false
-    val hasPatch = clearLabel || label != null || clearCategory || category != null || pinned != null || archived != null || unread != null
-    if (!hasPatch) return false
-    try {
-      val params =
-        buildJsonObject {
-          put("key", JsonPrimitive(sessionKey))
-          if (clearLabel) {
-            put("label", JsonNull)
-          } else if (label != null) {
-            put("label", JsonPrimitive(label))
-          }
-          if (clearCategory) {
-            put("category", JsonNull)
-          } else if (category != null) {
-            put("category", JsonPrimitive(category))
-          }
-          if (pinned != null) put("pinned", JsonPrimitive(pinned))
-          if (archived != null) put("archived", JsonPrimitive(archived))
-          if (unread != null) put("unread", JsonPrimitive(unread))
-        }
-      requestGateway("sessions.patch", params.toString())
-      if (archived == true) {
-        fallBackFromRetiredActiveSession(sessionKey)
-      }
-      fetchSessionsForCurrentWindow()
-      return true
-    } catch (err: Throwable) {
-      updateErrorText(err.message)
-      return false
-    }
-  }
-
-  suspend fun deleteSession(key: String) {
-    val sessionKey = key.trim().takeIf { it.isNotEmpty() } ?: return
-    try {
-      val params =
-        buildJsonObject {
-          put("key", JsonPrimitive(sessionKey))
-          put("deleteTranscript", JsonPrimitive(true))
-        }
-      requestGateway("sessions.delete", params.toString())
-      fallBackFromRetiredActiveSession(sessionKey)
-      fetchSessionsForCurrentWindow()
-    } catch (err: Throwable) {
-      updateErrorText(err.message)
-    }
-  }
-
-  // Archiving or deleting the open chat must not leave the app focused on a
-  // retired session; fall back to the gateway main session like web and iOS do.
-  private fun fallBackFromRetiredActiveSession(retiredKey: String) {
-    if (retiredKey != _sessionKey.value) return
-    switchSession("main")
-  }
-
-  suspend fun forkSession(parentKey: String): String? {
-    val sessionKey = parentKey.trim().takeIf { it.isNotEmpty() } ?: return null
-    return try {
-      val params =
-        buildJsonObject {
-          put("parentSessionKey", JsonPrimitive(sessionKey))
-          put("fork", JsonPrimitive(true))
-          // Keep the fork under the parent's agent; omitting agentId would create the
-          // child under the gateway's default agent for agent-qualified parents.
-          resolveAgentIdFromMainSessionKey(sessionKey)?.let { put("agentId", JsonPrimitive(it)) }
-        }
-      val createdKey = parseCreatedSessionKey(json, requestGateway("sessions.create", params.toString()))
-      fetchSessions(limit = currentSessionWindowLimit(), archived = false)
-      createdKey
-    } catch (err: Throwable) {
-      updateErrorText(err.message)
-      null
-    }
+  fun refreshSessions(limit: Int? = null) {
+    scope.launch { fetchSessions(limit = limit) }
   }
 
   /** Starts a fresh chat for the active gateway session key. */
@@ -373,6 +303,7 @@ class ChatController internal constructor(
 
   /** Starts a fresh chat and returns whether the gateway created the session. */
   suspend fun startNewChatAwait(worktree: Boolean = false): Boolean {
+    val createGatewayId = currentCacheScope()?.gatewayId
     val parentKey = normalizeRequestedSessionKey(_sessionKey.value)
     if (parentKey.isEmpty()) return false
     if (_pendingRunCount.value > 0) {
@@ -398,7 +329,7 @@ class ChatController internal constructor(
           put("label", JsonPrimitive(label))
           if (worktree) put("worktree", JsonPrimitive(true))
         }
-      val res = requestGateway("sessions.create", params.toString())
+      val res = requestGatewayBound(createGatewayId, "sessions.create", params.toString())
       if (!isCurrentHistoryLoad(parentKey, _sessionKey.value, requestGeneration, historyLoadGeneration.get())) {
         return false
       }
@@ -431,11 +362,6 @@ class ChatController internal constructor(
   fun switchSession(sessionKey: String) {
     val key = normalizeRequestedSessionKey(sessionKey)
     if (key.isEmpty()) return
-    if (key != unreadPatchSessionKey) {
-      unreadPatchSessionKey = key
-      unreadPatchRequested = false
-    }
-    acknowledgeUnreadIfNeeded(key, _sessions.value.firstOrNull { it.key == key })
     if (key == _sessionKey.value) return
     val generation = beginHistoryLoad(key, clearMessages = true)
     scope.launch {
@@ -501,6 +427,8 @@ class ChatController internal constructor(
     thinkingLevel: String,
     attachments: List<OutgoingAttachment>,
   ): Boolean {
+    val sendCacheScope = currentCacheScope()
+    val sendGatewayId = sendCacheScope?.gatewayId
     val trimmed = message.trim()
     if (trimmed.isEmpty() && attachments.isEmpty()) return false
     if (!_healthOk.value) {
@@ -580,7 +508,8 @@ class ChatController internal constructor(
             )
           }
         }
-      val res = requestGateway("chat.send", params.toString())
+      val res = requestGatewayBound(sendGatewayId, "chat.send", params.toString())
+      if (sendCacheScope != currentCacheScope()) return true
       val ack = parseChatSendAck(json, res)
       val actualRunId = ack.runId ?: runId
       if (actualRunId != runId) {
@@ -609,12 +538,14 @@ class ChatController internal constructor(
     } catch (err: CancellationException) {
       throw err
     } catch (err: GatewayRequestDefinitiveFailure) {
+      if (sendCacheScope != currentCacheScope()) return true
       clearPendingRun(runId)
       removeOptimisticMessage(runId)
       unresolvedRepliesByRunId.remove(runId)
       updateErrorText(err.message)
       false
     } catch (_: GatewayRequestOutcomeUnknown) {
+      if (sendCacheScope != currentCacheScope()) return true
       // A transport failure cannot distinguish rejection from an accepted send whose
       // ACK was lost. Keep the idempotency-key-backed row to prevent a duplicate retry.
       unknownOutcomeRunIds.add(runId)
@@ -623,6 +554,7 @@ class ChatController internal constructor(
       }
       true
     } catch (err: Throwable) {
+      if (sendCacheScope != currentCacheScope()) return true
       clearPendingRun(runId)
       removeOptimisticMessage(runId)
       unresolvedRepliesByRunId.remove(runId)
@@ -633,6 +565,7 @@ class ChatController internal constructor(
 
   /** Sends best-effort abort requests for every currently pending gateway run. */
   fun abort() {
+    val abortGatewayId = currentCacheScope()?.gatewayId
     val runIds =
       synchronized(pendingRuns) {
         pendingRuns.toList()
@@ -646,7 +579,7 @@ class ChatController internal constructor(
               put("sessionKey", JsonPrimitive(_sessionKey.value))
               put("runId", JsonPrimitive(runId))
             }
-          requestGateway("chat.abort", params.toString())
+          requestGatewayBound(abortGatewayId, "chat.abort", params.toString())
         } catch (_: Throwable) {
           // best-effort
         }
@@ -807,7 +740,8 @@ class ChatController internal constructor(
     val history =
       try {
         val historyJson =
-          requestGateway(
+          requestGatewayBound(
+            requestCacheScope?.gatewayId,
             "chat.history",
             buildJsonObject { put("sessionKey", JsonPrimitive(sessionKey)) }.toString(),
           )
@@ -977,28 +911,21 @@ class ChatController internal constructor(
     }
   }
 
-  private suspend fun fetchSessions(
-    limit: Int?,
-    archived: Boolean = false,
-  ) {
+  private suspend fun fetchSessions(limit: Int?) {
     try {
       val requestCacheScope = currentCacheScope()
-      val requestSequence = sessionsRequestSequence.incrementAndGet()
       val params =
         buildJsonObject {
           put("includeGlobal", JsonPrimitive(true))
           put("includeUnknown", JsonPrimitive(false))
           if (limit != null && limit > 0) put("limit", JsonPrimitive(limit))
-          if (archived) put("archived", JsonPrimitive(true))
         }
       val res = requestGateway("sessions.list", params.toString())
       val result = parseSessions(res)
       val retainedSessionKey =
         synchronized(gatewayScopeApplyLock) {
           if (requestCacheScope != currentCacheScope()) return
-          if (requestSequence != sessionsRequestSequence.get()) return
           _sessions.value = result.sessions
-          sessionsListArchived = archived
           val activeSessionKey = _sessionKey.value
           val activeOutsideLocalWindow =
             result.sessions
@@ -1006,22 +933,14 @@ class ChatController internal constructor(
               .any { session -> session.key == activeSessionKey }
           activeSessionKey.takeIf { result.isTruncated || activeOutsideLocalWindow }
         }
-      unreadPatchSessionKey?.let { trackedKey ->
-        acknowledgeUnreadIfNeeded(
-          key = trackedKey,
-          entry = result.sessions.firstOrNull { it.key == trackedKey },
-          requireActive = true,
-        )
-      }
-      if (!archived) {
-        persistSessions(requestCacheScope, result.sessions, retainedSessionKey)
-      }
+      persistSessions(requestCacheScope, result.sessions, retainedSessionKey)
     } catch (_: Throwable) {
       // best-effort
     }
   }
 
   private suspend fun fetchCommands() {
+    val requestCacheScope = currentCacheScope()
     val agentId = resolveAgentIdForSessionKey(_sessionKey.value)
     try {
       val params =
@@ -1030,42 +949,44 @@ class ChatController internal constructor(
           put("scope", JsonPrimitive("text"))
           put("includeArgs", JsonPrimitive(true))
         }
-      val res = requestGateway("commands.list", params.toString())
-      if (agentId == resolveAgentIdForSessionKey(_sessionKey.value)) {
-        _commands.value = parseChatCommands(json, res)
-        commandsAgentId = agentId
+      val res = requestGatewayBound(requestCacheScope?.gatewayId, "commands.list", params.toString())
+      synchronized(gatewayScopeApplyLock) {
+        if (requestCacheScope == currentCacheScope() && agentId == resolveAgentIdForSessionKey(_sessionKey.value)) {
+          _commands.value = parseChatCommands(json, res)
+          commandsAgentId = agentId
+        }
       }
     } catch (_: Throwable) {
-      if (agentId == resolveAgentIdForSessionKey(_sessionKey.value)) {
-        _commands.value = emptyList()
-        commandsAgentId = null
+      synchronized(gatewayScopeApplyLock) {
+        if (requestCacheScope == currentCacheScope() && agentId == resolveAgentIdForSessionKey(_sessionKey.value)) {
+          _commands.value = emptyList()
+          commandsAgentId = null
+        }
       }
     }
   }
 
-  private fun currentSessionWindowLimit(): Int = _sessions.value.size.takeIf { it > 0 } ?: 100
-
-  private suspend fun fetchSessionsForCurrentWindow() {
-    fetchSessions(limit = currentSessionWindowLimit(), archived = sessionsListArchived)
-  }
-
   private fun refreshSessionsForCurrentWindow() {
-    scope.launch { fetchSessionsForCurrentWindow() }
+    scope.launch { fetchSessions(limit = _sessions.value.size.takeIf { it > 0 } ?: 100) }
   }
 
   private suspend fun pollHealthIfNeeded(force: Boolean) {
+    val requestCacheScope = currentCacheScope()
     val now = System.currentTimeMillis()
     val last = lastHealthPollAtMs
     if (!force && last != null && now - last < 10_000) return
     lastHealthPollAtMs = now
     try {
-      requestGateway("health", null)
+      requestGatewayBound(requestCacheScope?.gatewayId, "health", null)
+      if (requestCacheScope != currentCacheScope()) return
       markHealthOk()
       if (_commands.value.isEmpty() || commandsAgentId != resolveAgentIdForSessionKey(_sessionKey.value)) {
         fetchCommands()
       }
     } catch (_: Throwable) {
-      _healthOk.value = false
+      if (requestCacheScope == currentCacheScope()) {
+        _healthOk.value = false
+      }
     }
   }
 
@@ -1227,7 +1148,7 @@ class ChatController internal constructor(
     var attempts = item.retryCount
     while (true) {
       val error =
-        when (val result = attemptOutboxSend(item)) {
+        when (val result = attemptOutboxSend(item, flushScope.gatewayId)) {
           OutboxSendResult.Accepted -> {
             // Ack received: delete the row so the flushed history copy is the only bubble left.
             runCatching { outbox.delete(item.id) }
@@ -1285,7 +1206,10 @@ class ChatController internal constructor(
     return OutboxSendOutcome.Stop
   }
 
-  private suspend fun attemptOutboxSend(item: ChatOutboxItem): OutboxSendResult =
+  private suspend fun attemptOutboxSend(
+    item: ChatOutboxItem,
+    gatewayId: String,
+  ): OutboxSendResult =
     try {
       val params =
         buildJsonObject {
@@ -1300,7 +1224,7 @@ class ChatController internal constructor(
           // acked-but-crashed item harmless.
           put("idempotencyKey", JsonPrimitive(item.id))
         }
-      val ack = parseChatSendAck(json, requestGateway("chat.send", params.toString()))
+      val ack = parseChatSendAck(json, requestGatewayBound(gatewayId, "chat.send", params.toString()))
       if (ack.isTerminalFailure) {
         OutboxSendResult.Rejected("Chat failed before the run started")
       } else {
@@ -1401,10 +1325,9 @@ class ChatController internal constructor(
       removeSessionEntry(payload["sessionKey"].asStringOrNull() ?: payload["key"].asStringOrNull())
       return
     }
-    val eventObject = eventSessionObject(payload)
-    val entry = eventObject?.let(::parseSessionEntry)
+    val entry = parseEventSessionEntry(payload)
     if (entry != null) {
-      upsertSessionEntry(entry, clearedFields = parseExplicitSessionClears(eventObject))
+      upsertSessionEntry(entry)
     } else {
       refreshSessionsForCurrentWindow()
     }
@@ -1412,22 +1335,13 @@ class ChatController internal constructor(
 
   private fun handleSessionMessageEvent(payloadJson: String) {
     val payload = json.parseToJsonElement(payloadJson).asObjectOrNull() ?: return
-    val eventObject = eventSessionObject(payload)
-    val entry = eventObject?.let(::parseSessionEntry)
+    val entry = parseEventSessionEntry(payload)
     if (entry != null) {
-      upsertSessionEntry(entry, clearedFields = parseExplicitSessionClears(eventObject))
+      upsertSessionEntry(entry)
     }
   }
 
-  private fun eventSessionObject(payload: JsonObject): JsonObject? = payload["session"].asObjectOrNull() ?: payload.takeIf { it["key"].asStringOrNull() != null }
-
-  // The gateway sends explicit JSON null for cleared label/category on session
-  // events; the merge must apply those clears instead of preserving stale values.
-  private fun parseExplicitSessionClears(obj: JsonObject): Set<String> =
-    buildSet {
-      if (obj["label"] is JsonNull) add("label")
-      if (obj["category"] is JsonNull) add("category")
-    }
+  private fun parseEventSessionEntry(payload: JsonObject): ChatSessionEntry? = payload["session"].asObjectOrNull()?.let(::parseSessionEntry) ?: parseSessionEntry(payload)
 
   private fun handleAgentEvent(payloadJson: String) {
     val payload = json.parseToJsonElement(payloadJson).asObjectOrNull() ?: return
@@ -1788,7 +1702,7 @@ class ChatController internal constructor(
     val messages =
       array.mapNotNull { item ->
         val obj = item.asObjectOrNull() ?: return@mapNotNull null
-        val role = normalizeVisibleChatMessageRole(obj["role"].asStringOrNull()) ?: return@mapNotNull null
+        val role = obj["role"].asStringOrNull() ?: return@mapNotNull null
         val content = parseChatMessageContents(obj)
         val ts = obj["timestamp"].asLongOrNull()
         ChatMessage(
@@ -1858,13 +1772,6 @@ class ChatController internal constructor(
       key = key,
       updatedAtMs = obj["updatedAt"].asLongOrNull(),
       displayName = obj["displayName"].asStringOrNull()?.trim(),
-      label = obj["label"].asStringOrNull()?.trim(),
-      category = obj["category"].asStringOrNull()?.trim(),
-      pinned = obj["pinned"].asBooleanOrNull(),
-      archived = obj["archived"].asBooleanOrNull(),
-      unread = obj["unread"].asBooleanOrNull(),
-      lastReadAt = obj["lastReadAt"].asLongOrNull(),
-      lastActivityAt = obj["lastActivityAt"].asLongOrNull(),
       totalTokens = obj["totalTokens"].asLongOrNull(),
       totalTokensFresh = obj["totalTokensFresh"].asBooleanOrNull(),
       contextTokens = obj["contextTokens"].asLongOrNull(),
@@ -1883,63 +1790,22 @@ class ChatController internal constructor(
   private fun upsertSessionEntry(
     entry: ChatSessionEntry,
     preserveExistingContextUsageWithoutTotal: Boolean = false,
-    clearedFields: Set<String> = emptySet(),
   ) {
     val current = _sessions.value
     val index = current.indexOfFirst { it.key == entry.key }
-    var applied = entry
     _sessions.value =
       if (index >= 0) {
         current.toMutableList().also {
-          applied =
+          it[index] =
             mergeChatSessionEntry(
               existing = it[index],
               next = entry,
               preserveExistingContextUsageWithoutTotal = preserveExistingContextUsageWithoutTotal,
             )
-          if (clearedFields.isNotEmpty()) {
-            applied =
-              applied.copy(
-                label = if ("label" in clearedFields) null else applied.label,
-                category = if ("category" in clearedFields) null else applied.category,
-              )
-          }
-          it[index] = applied
         }
       } else {
         listOf(entry) + current
       }
-    acknowledgeUnreadIfNeeded(applied.key, applied, requireActive = true)
-  }
-
-  /**
-   * Acknowledges unread state for the visited session at most once per unread episode: the
-   * pending flag resets when the server-confirmed read (unread=false) is observed, so a run
-   * finishing while the session stays open re-acknowledges without patch loops (the gateway
-   * stamps lastReadAt server-side, which makes the exchange convergent).
-   */
-  private fun acknowledgeUnreadIfNeeded(
-    key: String,
-    entry: ChatSessionEntry?,
-    requireActive: Boolean = false,
-  ) {
-    if (key.isEmpty() || key != unreadPatchSessionKey) return
-    if (entry?.unread == false) {
-      unreadPatchRequested = false
-      return
-    }
-    if (entry?.unread != true || unreadPatchRequested) return
-    // switchSession acknowledges before _sessionKey updates; background upserts only
-    // re-acknowledge the session that is currently open.
-    if (requireActive && key != _sessionKey.value) return
-    unreadPatchRequested = true
-    _sessions.value = _sessions.value.map { if (it.key == key) it.copy(unread = false) else it }
-    scope.launch {
-      // A failed read patch must unlatch the episode so later snapshots retry.
-      if (!patchSession(key = key, unread = false) && unreadPatchSessionKey == key) {
-        unreadPatchRequested = false
-      }
-    }
   }
 
   private fun removeSessionEntry(sessionKey: String?) {
@@ -1957,6 +1823,17 @@ class ChatController internal constructor(
       publishOutbox()
     }
   }
+
+  private suspend fun requestGatewayBound(
+    gatewayId: String?,
+    method: String,
+    paramsJson: String?,
+  ): String =
+    if (gatewayId == null) {
+      requestGateway(method, paramsJson)
+    } else {
+      requestGatewayForGateway(gatewayId, method, paramsJson)
+    }
 
   private fun currentCacheScope(): ChatCacheScope? {
     val scope = cacheScope() ?: return null
@@ -2257,13 +2134,6 @@ internal fun mergeChatSessionEntry(
   return existing.copy(
     updatedAtMs = next.updatedAtMs ?: existing.updatedAtMs,
     displayName = next.displayName ?: existing.displayName,
-    label = next.label ?: existing.label,
-    category = next.category ?: existing.category,
-    pinned = next.pinned ?: existing.pinned,
-    archived = next.archived ?: existing.archived,
-    unread = next.unread ?: existing.unread,
-    lastReadAt = next.lastReadAt ?: existing.lastReadAt,
-    lastActivityAt = next.lastActivityAt ?: existing.lastActivityAt,
     totalTokens =
       when {
         preserveExistingContextUsage -> existing.totalTokens

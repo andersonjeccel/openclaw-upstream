@@ -7,6 +7,8 @@ import ai.openclaw.app.chat.ChatPendingToolCall
 import ai.openclaw.app.chat.ChatSessionEntry
 import ai.openclaw.app.chat.OutgoingAttachment
 import ai.openclaw.app.gateway.GatewayEndpoint
+import ai.openclaw.app.gateway.GatewayRegistryEntry
+import ai.openclaw.app.gateway.GatewayRegistryEntryKind
 import ai.openclaw.app.gateway.GatewayUpdateAvailableSummary
 import ai.openclaw.app.node.CameraCaptureManager
 import ai.openclaw.app.node.CanvasController
@@ -27,16 +29,9 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-
-enum class ChatDraftPlacement {
-  Replace,
-  BeforeExisting,
-}
-
-data class ChatDraft(
-  val text: String,
-  val placement: ChatDraftPlacement,
-)
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * UI-facing bridge that exposes NodeRuntime and preference state as Compose-friendly StateFlows.
@@ -48,6 +43,8 @@ class MainViewModel(
   private val nodeApp = app as NodeApp
   private val prefs = nodeApp.prefs
   private val runtimeRef = MutableStateFlow<NodeRuntime?>(null)
+  private val gatewayConfigOperationSeq = AtomicLong()
+  private val gatewayConfigOperationMutex = Mutex()
 
   @Volatile private var foreground = false
 
@@ -57,8 +54,8 @@ class MainViewModel(
   val requestedHomeDestination: StateFlow<HomeDestination?> = _requestedHomeDestination
   private val _startOnboardingAtGatewaySetup = MutableStateFlow(false)
   val startOnboardingAtGatewaySetup: StateFlow<Boolean> = _startOnboardingAtGatewaySetup
-  private val _chatDraft = MutableStateFlow<ChatDraft?>(null)
-  val chatDraft: StateFlow<ChatDraft?> = _chatDraft
+  private val _chatDraft = MutableStateFlow<String?>(null)
+  val chatDraft: StateFlow<String?> = _chatDraft
   private val _pendingAssistantAutoSend = MutableStateFlow<String?>(null)
   val pendingAssistantAutoSend: StateFlow<String?> = _pendingAssistantAutoSend
   private val _assistantAutoSendInFlight = MutableStateFlow(false)
@@ -188,8 +185,8 @@ class MainViewModel(
   val manualHost: StateFlow<String> = prefs.manualHost
   val manualPort: StateFlow<Int> = prefs.manualPort
   val manualTls: StateFlow<Boolean> = prefs.manualTls
-  val gatewayToken: StateFlow<String> = prefs.gatewayToken
-  val gatewayBootstrapToken: StateFlow<String> = prefs.gatewayBootstrapToken
+  val pairedGateways: StateFlow<List<GatewayRegistryEntry>> = prefs.gatewayRegistry.entries
+  val activeGatewayStableId: StateFlow<String?> = prefs.gatewayRegistry.activeStableId
   val onboardingCompleted: StateFlow<Boolean> = prefs.onboardingCompleted
   val canvasDebugStatusEnabled: StateFlow<Boolean> = prefs.canvasDebugStatusEnabled
   val installedAppsSharingEnabled: StateFlow<Boolean> = prefs.installedAppsSharingEnabled
@@ -299,54 +296,71 @@ class MainViewModel(
     prefs.setManualTls(value)
   }
 
-  fun setGatewayBootstrapToken(value: String) {
-    prefs.setGatewayBootstrapToken(value)
-  }
-
-  fun setGatewayPassword(value: String) {
-    prefs.setGatewayPassword(value)
-  }
-
   /** Clears setup credentials without starting the runtime just to discard first-run pairing auth. */
-  private suspend fun resetGatewaySetupAuth(): Boolean {
-    val reset = nodeApp.resetGatewaySetupAuth()
+  private suspend fun resetGatewaySetupAuth(stableId: String): Boolean {
+    val reset = nodeApp.resetGatewaySetupAuth(stableId)
     nodeApp.peekRuntime()?.let { runtimeRef.value = it }
     return reset
   }
 
   internal fun saveGatewayConfigAndConnect(plan: GatewayConnectPlan) {
+    val operation = gatewayConfigOperationSeq.incrementAndGet()
     // Gateway pairing touches encrypted prefs, identity files, and sockets; keep
     // the whole sequence off the Compose thread so retries cannot trigger ANRs.
     viewModelScope.launch(Dispatchers.Default) {
-      val config = plan.config
-      val replacesSavedAuth = plan.savedAuthAction != GatewaySavedAuthAction.PRESERVE
-      if (replacesSavedAuth && !resetGatewaySetupAuth()) return@launch
-      prefs.setManualEnabled(true)
-      prefs.setManualHost(config.host)
-      prefs.setManualPort(config.port)
-      prefs.setManualTls(config.tls)
+      gatewayConfigOperationMutex.withLock {
+        if (operation != gatewayConfigOperationSeq.get()) return@withLock
+        val config = plan.config
+        val endpoint = GatewayEndpoint.manual(host = config.host, port = config.port)
+        val targetAlreadyPaired =
+          prefs.gatewayRegistry.entries.value
+            .any { it.stableId == endpoint.stableId }
+        val blankCredentials = config.token.isEmpty() && config.bootstrapToken.isEmpty() && config.password.isEmpty()
+        val preservesPairedTarget =
+          targetAlreadyPaired && blankCredentials && plan.savedAuthAction == GatewaySavedAuthAction.REPLACE_ENDPOINT
+        val replacesSavedAuth = plan.savedAuthAction != GatewaySavedAuthAction.PRESERVE && !preservesPairedTarget
+        if (replacesSavedAuth && !resetGatewaySetupAuth(endpoint.stableId)) return@launch
+        if (operation != gatewayConfigOperationSeq.get()) return@launch
+        prefs.setManualEnabled(true)
+        prefs.setManualHost(config.host)
+        prefs.setManualPort(config.port)
+        prefs.setManualTls(config.tls)
 
-      // A blank same-endpoint save means "keep access". Secrets remain runtime-owned,
-      // including password-only setups that Compose deliberately cannot read back.
-      if (replacesSavedAuth) {
-        prefs.setGatewayBootstrapToken(config.bootstrapToken)
-        prefs.setGatewayToken(config.token)
-        prefs.setGatewayPassword(config.password)
-      }
+        // A blank same-endpoint save means "keep access". Secrets remain runtime-owned,
+        // including password-only setups that Compose deliberately cannot read back.
+        if (replacesSavedAuth) {
+          prefs.saveGatewayCredentials(
+            stableId = endpoint.stableId,
+            token = config.token,
+            bootstrapToken = config.bootstrapToken,
+            password = config.password,
+          )
+        }
 
-      val runtime = ensureRuntime()
-      val endpoint = GatewayEndpoint.manual(host = config.host, port = config.port)
-      if (replacesSavedAuth) {
-        runtime.connect(
-          endpoint,
-          NodeRuntime.GatewayConnectAuth(
-            token = config.token.ifEmpty { null },
-            bootstrapToken = config.bootstrapToken.ifEmpty { null },
-            password = config.password.ifEmpty { null },
+        prefs.gatewayRegistry.upsert(
+          GatewayRegistryEntry(
+            stableId = endpoint.stableId,
+            kind = GatewayRegistryEntryKind.MANUAL,
+            name = endpoint.name,
+            host = config.host,
+            port = config.port,
+            tls = config.tls,
           ),
         )
-      } else {
-        runtime.connect(endpoint)
+
+        val runtime = ensureRuntime()
+        if (replacesSavedAuth) {
+          runtime.connectSwitchingGateway(
+            endpoint,
+            NodeRuntime.GatewayConnectAuth(
+              token = config.token.ifEmpty { null },
+              bootstrapToken = config.bootstrapToken.ifEmpty { null },
+              password = config.password.ifEmpty { null },
+            ),
+          )
+        } else {
+          runtime.connectSwitchingGateway(endpoint)
+        }
       }
     }
   }
@@ -361,10 +375,17 @@ class MainViewModel(
 
   /** Re-enters gateway setup after disconnecting and clearing one-time setup credentials. */
   fun pairNewGateway() {
+    val operation = gatewayConfigOperationSeq.incrementAndGet()
     viewModelScope.launch(Dispatchers.Default) {
-      if (!resetGatewaySetupAuth()) return@launch
-      prefs.setOnboardingCompleted(false)
-      _startOnboardingAtGatewaySetup.value = true
+      gatewayConfigOperationMutex.withLock {
+        if (operation != gatewayConfigOperationSeq.get()) return@withLock
+        nodeApp.peekRuntime()?.also { runtime ->
+          runtimeRef.value = runtime
+          runtime.prepareForGatewaySetup()
+        }
+        prefs.setOnboardingCompleted(false)
+        _startOnboardingAtGatewaySetup.value = true
+      }
     }
   }
 
@@ -425,7 +446,7 @@ class MainViewModel(
       return
     }
     _pendingAssistantAutoSend.value = null
-    _chatDraft.value = request.prompt?.let { ChatDraft(text = it, placement = ChatDraftPlacement.Replace) }
+    _chatDraft.value = request.prompt
   }
 
   fun clearRequestedHomeDestination() {
@@ -438,11 +459,6 @@ class MainViewModel(
 
   fun clearChatDraft() {
     _chatDraft.value = null
-  }
-
-  fun setChatReplyDraft(value: String) {
-    _pendingAssistantAutoSend.value = null
-    _chatDraft.value = ChatDraft(text = value, placement = ChatDraftPlacement.BeforeExisting)
   }
 
   /** Claims an assistant prompt before sending so Compose effect restarts cannot dispatch it twice. */
@@ -505,12 +521,14 @@ class MainViewModel(
   }
 
   fun connect(endpoint: GatewayEndpoint) {
-    ensureRuntime().connect(endpoint)
+    viewModelScope.launch(Dispatchers.Default) {
+      ensureRuntime().connectSwitchingGateway(endpoint)
+    }
   }
 
   fun connectInBackground(endpoint: GatewayEndpoint) {
     viewModelScope.launch(Dispatchers.Default) {
-      ensureRuntime().connect(endpoint)
+      ensureRuntime().connectSwitchingGateway(endpoint)
     }
   }
 
@@ -520,22 +538,53 @@ class MainViewModel(
     bootstrapToken: String?,
     password: String?,
   ) {
-    ensureRuntime().connect(
-      endpoint,
-      NodeRuntime.GatewayConnectAuth(
-        token = token,
-        bootstrapToken = bootstrapToken,
-        password = password,
-      ),
-    )
+    viewModelScope.launch(Dispatchers.Default) {
+      ensureRuntime().connectSwitchingGateway(
+        endpoint,
+        NodeRuntime.GatewayConnectAuth(
+          token = token,
+          bootstrapToken = bootstrapToken,
+          password = password,
+        ),
+      )
+    }
   }
 
   fun connectManual() {
     ensureRuntime().connectManual()
   }
 
+  fun switchToGateway(stableId: String) {
+    val operation = gatewayConfigOperationSeq.incrementAndGet()
+    viewModelScope.launch(Dispatchers.Default) {
+      gatewayConfigOperationMutex.withLock {
+        if (operation == gatewayConfigOperationSeq.get()) {
+          ensureRuntime().switchToGateway(stableId)
+        }
+      }
+    }
+  }
+
+  fun forgetGateway(stableId: String) {
+    val operation = gatewayConfigOperationSeq.incrementAndGet()
+    viewModelScope.launch(Dispatchers.Default) {
+      gatewayConfigOperationMutex.withLock {
+        if (operation == gatewayConfigOperationSeq.get()) {
+          ensureRuntime().forgetGateway(stableId)
+        }
+      }
+    }
+  }
+
   fun disconnect() {
-    runtimeRef.value?.disconnect()
+    val operation = gatewayConfigOperationSeq.incrementAndGet()
+    viewModelScope.launch(Dispatchers.Default) {
+      gatewayConfigOperationMutex.withLock {
+        if (operation == gatewayConfigOperationSeq.get()) {
+          runtimeRef.value?.disconnect()
+        }
+      }
+    }
   }
 
   fun acceptGatewayTrustPrompt() {
@@ -627,40 +676,9 @@ class MainViewModel(
     ensureRuntime().refreshChat()
   }
 
-  fun refreshChatSessions(
-    limit: Int? = null,
-    archived: Boolean = false,
-  ) {
-    ensureRuntime().refreshChatSessions(limit = limit, archived = archived)
+  fun refreshChatSessions(limit: Int? = null) {
+    ensureRuntime().refreshChatSessions(limit = limit)
   }
-
-  suspend fun patchChatSession(
-    key: String,
-    label: String? = null,
-    clearLabel: Boolean = false,
-    category: String? = null,
-    clearCategory: Boolean = false,
-    pinned: Boolean? = null,
-    archived: Boolean? = null,
-    unread: Boolean? = null,
-  ) {
-    ensureRuntime().patchChatSession(
-      key = key,
-      label = label,
-      clearLabel = clearLabel,
-      category = category,
-      clearCategory = clearCategory,
-      pinned = pinned,
-      archived = archived,
-      unread = unread,
-    )
-  }
-
-  suspend fun deleteChatSession(key: String) {
-    ensureRuntime().deleteChatSession(key)
-  }
-
-  suspend fun forkChatSession(parentKey: String): String? = ensureRuntime().forkChatSession(parentKey)
 
   fun setChatThinkingLevel(level: String) {
     ensureRuntime().setChatThinkingLevel(level)

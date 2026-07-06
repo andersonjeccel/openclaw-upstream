@@ -1,7 +1,5 @@
 package ai.openclaw.app.ui.chat
 
-import ai.openclaw.app.ChatDraft
-import ai.openclaw.app.ChatDraftPlacement
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -9,33 +7,10 @@ import org.junit.Test
 
 class ChatComposerDraftTest {
   @Test
-  fun replyDraftPreservesExistingComposerText() {
-    val draft = ChatDraft(text = "> quoted\n\n", placement = ChatDraftPlacement.BeforeExisting)
-
-    assertEquals("> quoted\n\nmy reply", mergeChatDraft(draft, "my reply"))
-  }
-
-  @Test
-  fun preservesReplySeparatorWhitespace() {
-    val draft = ChatDraft(text = "> quoted\n\n", placement = ChatDraftPlacement.BeforeExisting)
-
-    val applied =
-      applyDraftText(
-        draft = draft,
-        currentInput = "",
-        lastAppliedDraft = null,
-      )
-
-    assertEquals(draft.text, applied.input)
-    assertEquals(draft.text, applied.lastAppliedDraft)
-    assertTrue(applied.consumed)
-  }
-
-  @Test
   fun clearsLastAppliedDraftWhenViewModelDraftResets() {
     val consumed =
       applyDraftText(
-        draft = ChatDraft(text = "repeat this", placement = ChatDraftPlacement.Replace),
+        draftText = "repeat this",
         currentInput = "",
         lastAppliedDraft = null,
       )
@@ -46,7 +21,7 @@ class ChatComposerDraftTest {
 
     val cleared =
       applyDraftText(
-        draft = null,
+        draftText = null,
         currentInput = consumed.input,
         lastAppliedDraft = consumed.lastAppliedDraft,
       )
@@ -57,7 +32,7 @@ class ChatComposerDraftTest {
 
     val repeated =
       applyDraftText(
-        draft = ChatDraft(text = "repeat this", placement = ChatDraftPlacement.Replace),
+        draftText = "repeat this",
         currentInput = cleared.input,
         lastAppliedDraft = cleared.lastAppliedDraft,
       )

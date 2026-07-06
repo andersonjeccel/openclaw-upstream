@@ -260,7 +260,6 @@ fun OnboardingFlow(
     val nodesDevicesRefreshing by viewModel.nodesDevicesRefreshing.collectAsState()
     val serverName by viewModel.serverName.collectAsState()
     val gateways by viewModel.gateways.collectAsState()
-    val savedToken by viewModel.gatewayToken.collectAsState()
     val savedManualHost by viewModel.manualHost.collectAsState()
     val savedManualPort by viewModel.manualPort.collectAsState()
     val savedManualTls by viewModel.manualTls.collectAsState()
@@ -278,7 +277,7 @@ fun OnboardingFlow(
     var manualHost by rememberSaveable { mutableStateOf("") }
     var manualPort by rememberSaveable { mutableStateOf("18789") }
     var manualTls by rememberSaveable { mutableStateOf(false) }
-    var token by rememberSaveable { mutableStateOf(savedToken) }
+    var token by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
     var setupError by rememberSaveable { mutableStateOf<String?>(null) }
     var setupScanError by rememberSaveable { mutableStateOf<String?>(null) }
@@ -543,7 +542,8 @@ fun OnboardingFlow(
         val message =
           when (scanned.error) {
             GatewayEndpointValidationError.INSECURE_REMOTE_URL,
-            GatewayEndpointValidationError.IPV6_ZONE_ID_UNSUPPORTED ->
+            GatewayEndpointValidationError.IPV6_ZONE_ID_UNSUPPORTED,
+            ->
               gatewayEndpointValidationMessage(scanned.error, GatewayEndpointInputSource.QR_SCAN)
             else -> "That QR code is not an OpenClaw setup QR. Generate a fresh code with openclaw qr, then try again."
           }

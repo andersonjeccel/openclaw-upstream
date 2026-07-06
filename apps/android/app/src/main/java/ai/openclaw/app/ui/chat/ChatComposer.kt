@@ -1,7 +1,5 @@
 package ai.openclaw.app.ui.chat
 
-import ai.openclaw.app.ChatDraft
-import ai.openclaw.app.ChatDraftPlacement
 import ai.openclaw.app.chat.ChatCommandEntry
 import ai.openclaw.app.ui.mobileAccent
 import ai.openclaw.app.ui.mobileAccentBorderStrong
@@ -72,17 +70,6 @@ internal data class DraftApplication(
   val consumed: Boolean,
 )
 
-internal fun mergeChatDraft(
-  draft: ChatDraft?,
-  currentInput: String,
-): String? {
-  val text = draft?.text?.takeIf { it.isNotBlank() } ?: return null
-  return when (draft.placement) {
-    ChatDraftPlacement.Replace -> text
-    ChatDraftPlacement.BeforeExisting -> text + currentInput
-  }
-}
-
 internal data class SheetSlashCommandSelection(
   val input: String,
 )
@@ -99,24 +86,17 @@ internal fun resolveSheetComposerSendAction(input: String): SheetComposerSendAct
 
 /** Applies a draft exactly once so restored prompts do not overwrite user edits. */
 internal fun applyDraftText(
-  draft: ChatDraft?,
+  draftText: String?,
   currentInput: String,
   lastAppliedDraft: String?,
 ): DraftApplication {
-  val appliedDraft =
-    draft ?: return DraftApplication(
+  val draft =
+    draftText?.trim()?.ifEmpty { null } ?: return DraftApplication(
       input = currentInput,
       lastAppliedDraft = null,
       consumed = false,
     )
-  val nextInput =
-    mergeChatDraft(appliedDraft, currentInput) ?: return DraftApplication(
-      input = currentInput,
-      lastAppliedDraft = null,
-      consumed = false,
-    )
-  val draftText = appliedDraft.text
-  if (draftText == lastAppliedDraft) {
+  if (draft == lastAppliedDraft) {
     return DraftApplication(
       input = currentInput,
       lastAppliedDraft = lastAppliedDraft,
@@ -124,8 +104,8 @@ internal fun applyDraftText(
     )
   }
   return DraftApplication(
-    input = nextInput,
-    lastAppliedDraft = draftText,
+    input = draft,
+    lastAppliedDraft = draft,
     consumed = true,
   )
 }
@@ -133,7 +113,7 @@ internal fun applyDraftText(
 /** Chat input surface for text, image attachments, thinking level, and run controls. */
 @Composable
 fun ChatComposer(
-  draftText: ChatDraft?,
+  draftText: String?,
   healthOk: Boolean,
   thinkingLevel: String,
   pendingRunCount: Int,
@@ -158,7 +138,7 @@ fun ChatComposer(
     }
 
   LaunchedEffect(draftText) {
-    val next = applyDraftText(draft = draftText, currentInput = input, lastAppliedDraft = lastAppliedDraft)
+    val next = applyDraftText(draftText = draftText, currentInput = input, lastAppliedDraft = lastAppliedDraft)
     input = next.input
     lastAppliedDraft = next.lastAppliedDraft
     if (next.consumed) {
