@@ -306,15 +306,16 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
     }
 
     private static func invokeRequestData(id: String, command: String, paramsJSON: String?) -> Data {
+        let payload: [String: Any] = [
+            "id": id,
+            "nodeId": "test-node",
+            "command": command,
+            "paramsJSON": paramsJSON ?? NSNull(),
+        ]
         let frame: [String: Any] = [
             "type": "event",
             "event": "node.invoke.request",
-            "payload": [
-                "id": id,
-                "nodeId": "test-node",
-                "command": command,
-                "paramsJSON": paramsJSON ?? (NSNull() as Any),
-            ],
+            "payload": payload,
         ]
         return (try? JSONSerialization.data(withJSONObject: frame)) ?? Data()
     }
