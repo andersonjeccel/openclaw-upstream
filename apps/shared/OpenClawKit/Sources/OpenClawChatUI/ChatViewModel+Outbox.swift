@@ -43,22 +43,40 @@ extension OpenClawChatViewModel {
 
     public func deleteOutboxMessage(_ messageID: UUID) {
         guard let outbox, let commandID = self.outboxCommandIDsByMessageID[messageID] else { return }
-        // Tombstone first, synchronously: an active flush checks this set
-        // right before its transport call, so the deleted command cannot be
-        // sent even if the row deletion below races the flush's claim.
-        self.deletedOutboxCommandIDs.insert(commandID)
+        self.cancelingOutboxCommandIDs.insert(commandID)
+        self.outboxPresentationGeneration &+= 1
         Task { [weak self] in
-            // Durable delete before the bubble disappears: if the process
-            // dies in this window, both the row and the visible bubble
-            // survive, so a user-deleted command can never silently
-            // resurrect and send on the next launch.
-            await outbox.deleteCommand(id: commandID)
             guard let self else { return }
-            // Row is durably gone; the tombstone has done its job.
-            self.deletedOutboxCommandIDs.remove(commandID)
+            let result = await outbox.cancelCommand(id: commandID)
+            guard result != .unavailable else {
+                self.finishOutboxCancellation(commandID)
+                self.errorText = "Could not delete the queued message. Try again."
+                return
+            }
+            if result == .missing {
+                let presentationGeneration = self.outboxPresentationGeneration
+                let current = await outbox.loadCommands().first(where: { $0.id == commandID })
+                guard presentationGeneration == self.outboxPresentationGeneration else {
+                    self.finishOutboxCancellation(commandID)
+                    return
+                }
+                if let current {
+                    // Another view model claimed the row first. Keep the bubble
+                    // and show its authoritative state; cancellation after claim
+                    // would promise deletion while the request can still land.
+                    self.finishOutboxCancellation(commandID)
+                    self.presentOutboxCommands([current])
+                    return
+                }
+            }
+            self.finishOutboxCancellation(commandID)
             self.outboxCommandIDsByMessageID.removeValue(forKey: messageID)
             self.outboxMessageIDsByCommandID.removeValue(forKey: commandID)
             self.outboxStatesByMessageID.removeValue(forKey: messageID)
+            // `.missing` with no current row means another view already
+            // canceled (or canonical history completed) this mapping. Never
+            // leave its stale bubble looking like an ordinary sent message;
+            // canonical history can re-add a genuinely delivered row.
             self.replaceMessages(self.messages.filter { $0.id != messageID })
         }
     }
@@ -148,15 +166,24 @@ extension OpenClawChatViewModel {
         Task { [weak self] in
             guard let self else { return }
             await self.recoverInterruptedOutboxSendsIfNeeded()
-            let commands = await outbox.loadCommands()
-            guard self.isCurrentSession(session) else { return }
-            self.presentOutboxCommands(commands.filter { $0.sessionKey == session.key })
-            // The FIFO send gate assumes a backlog until this point.
-            self.hasRestoredOutboxMessages = true
-            // Relaunching while already healthy never sees an unhealthy ->
-            // healthy transition, so kick the flush here as well.
-            if self.healthOK, commands.contains(where: { $0.status == .queued }) {
-                self.flushOutboxIfNeeded()
+            while self.isCurrentSession(session) {
+                let presentationGeneration = self.outboxPresentationGeneration
+                let commands = await outbox.loadCommands()
+                guard self.isCurrentSession(session) else { return }
+                if presentationGeneration != self.outboxPresentationGeneration {
+                    // A cross-view cancellation/confirmation invalidated this
+                    // snapshot. Reload so unrelated surviving rows still paint.
+                    continue
+                }
+                self.presentOutboxCommands(commands.filter { $0.sessionKey == session.key })
+                // The FIFO send gate assumes a backlog until this point.
+                self.hasRestoredOutboxMessages = true
+                // Relaunching while already healthy never sees an unhealthy ->
+                // healthy transition, so kick the flush here as well.
+                if self.healthOK, commands.contains(where: { $0.status == .queued }) {
+                    self.flushOutboxIfNeeded()
+                }
+                return
             }
         }
     }
@@ -164,17 +191,24 @@ extension OpenClawChatViewModel {
     /// Canonical history is the durable acceptance boundary. Any matching
     /// outbox row—including a lost-ACK queued row—is now safe to remove
     /// without replaying the user turn.
-    func confirmOutboxCommands(in messages: [OpenClawChatMessage], session: SessionSnapshot) {
+    func confirmOutboxCommands(in messages: [OpenClawChatMessage]) {
+        Task { [weak self] in
+            await self?.confirmOutboxCommandsNow(in: messages)
+        }
+    }
+
+    func confirmOutboxCommandsNow(in messages: [OpenClawChatMessage]) async {
         guard let outbox else { return }
         let confirmedKeys = Set(messages.compactMap { Self.normalizedIdempotencyKey($0.idempotencyKey) })
         guard !confirmedKeys.isEmpty else { return }
-        Task { [weak self] in
-            guard let self else { return }
-            let commands = await outbox.loadCommands().filter { command in
-                command.sessionKey == session.key && confirmedKeys.contains(Self.outboxUserIdempotencyKey(command.id))
-            }
-            for command in commands {
-                await outbox.deleteCommand(id: command.id)
+        let commands = await outbox.loadCommands().filter { command in
+            // Command UUIDs are gateway-global. Match the durable identity,
+            // not a presentation alias (`main` vs `agent:<id>:main`).
+            confirmedKeys.contains(Self.outboxUserIdempotencyKey(command.id))
+        }
+        for command in commands {
+            let result = await outbox.confirmCommand(id: command.id)
+            if result != .unavailable {
                 self.clearOutboxState(forCommandID: command.id)
             }
         }
@@ -188,9 +222,7 @@ extension OpenClawChatViewModel {
         guard !commands.isEmpty else { return }
         var next = self.messages
         for command in commands.sorted(by: { $0.createdAt < $1.createdAt }) {
-            // User-deleted commands awaiting durable removal must not be
-            // re-presented or re-mapped by a concurrent restore/flush pass.
-            if self.deletedOutboxCommandIDs.contains(command.id) { continue }
+            if self.cancelingOutboxCommandIDs.contains(command.id) { continue }
             let key = Self.outboxUserIdempotencyKey(command.id)
             if let existing = next.first(where: { $0.idempotencyKey == key }) {
                 self.mapOutboxCommand(command, to: existing.id)
@@ -290,28 +322,30 @@ extension OpenClawChatViewModel {
 
     private func performOutboxFlush() async {
         guard let outbox else { return }
+        guard let routeLease = await self.transport.acquireOutboxRouteLease() else {
+            // The store owner no longer matches the active gateway route.
+            // Leave every row queued; the replacement view model owns the
+            // new gateway and a later matching reconnect can resume this one.
+            self.applyTransportHealth(false)
+            return
+        }
         await self.recoverInterruptedOutboxSendsIfNeeded()
-        var flushedCurrentSession = false
+        var flushedSessionKeys: Set<String> = []
         while self.healthOK {
+            let presentationGeneration = self.outboxPresentationGeneration
             let commands = await outbox.loadCommands()
+            if presentationGeneration != self.outboxPresentationGeneration {
+                continue
+            }
             self.presentOutboxCommands(commands.filter { $0.sessionKey == self.sessionKey })
             guard let next = await outbox.claimNextCommand() else { break }
             // Same ordering contract as the live send path: a run must not
             // start on a stale model while a sessions.patch(model) for its
             // session is still in flight.
             await self.waitForPendingModelPatches(in: next.sessionKey)
-            // Delete may race the atomic claim while it is awaiting the store.
-            // Delete durably before continuing so younger rows cannot strand
-            // behind a sending tombstone.
-            if self.deletedOutboxCommandIDs.contains(next.id) {
-                await outbox.deleteCommand(id: next.id)
-                self.deletedOutboxCommandIDs.remove(next.id)
-                self.clearOutboxState(forCommandID: next.id)
-                continue
-            }
             self.setOutboxState(.sending, forCommandID: next.id)
             do {
-                let response = try await self.transport.sendMessage(
+                let response = try await routeLease.sendMessage(
                     sessionKey: next.sessionKey,
                     message: next.text,
                     // Thinking level captured at enqueue time, never the
@@ -353,9 +387,18 @@ extension OpenClawChatViewModel {
                     self.clearOutboxState(forCommandID: next.id)
                 }
                 self.outboxTransportFailureStreak = 0
-                if next.sessionKey == self.sessionKey {
-                    flushedCurrentSession = true
-                }
+                flushedSessionKeys.insert(next.sessionKey)
+            } catch is CancellationError {
+                // The leased gateway route changed while the request was
+                // suspended. Never reacquire inside this pass: doing so could
+                // retarget this gateway-scoped row to the replacement route.
+                await outbox.markCommandQueued(
+                    id: next.id,
+                    retryCount: next.retryCount,
+                    lastError: nil)
+                self.setOutboxState(.queued, forCommandID: next.id)
+                self.applyTransportHealth(false)
+                break
             } catch let error as GatewayResponseError {
                 // A response error proves the gateway rejected the request;
                 // unlike a socket/timeout failure, replay cannot duplicate an
@@ -392,12 +435,10 @@ extension OpenClawChatViewModel {
                 break
             }
         }
-        // Tombstones are NOT cleared here: each lives until its delete task
-        // confirms the row is durably gone (process death in that window
-        // leaves both row and tombstone-protected bubble intact). The set
-        // stays bounded by in-flight user deletes.
-        if flushedCurrentSession {
-            await self.refreshHistoryAfterOutboxFlush()
+        if !flushedSessionKeys.isEmpty {
+            await self.refreshHistoriesAfterOutboxFlush(
+                sessionKeys: flushedSessionKeys,
+                routeLease: routeLease)
         }
     }
 
@@ -472,6 +513,29 @@ extension OpenClawChatViewModel {
         guard let messageID = self.outboxMessageIDsByCommandID.removeValue(forKey: commandID) else { return }
         self.outboxCommandIDsByMessageID.removeValue(forKey: messageID)
         self.outboxStatesByMessageID.removeValue(forKey: messageID)
+    }
+
+    func handleOutboxChange(_ change: OpenClawChatOutboxChange) {
+        // Invalidates every command snapshot that started loading before the
+        // store mutation, including snapshots owned by another view model.
+        self.outboxPresentationGeneration &+= 1
+        switch change {
+        case let .canceled(commandID):
+            guard let messageID = self.outboxMessageIDsByCommandID[commandID] else { return }
+            self.clearOutboxState(forCommandID: commandID)
+            self.replaceMessages(self.messages.filter { $0.id != messageID })
+        case let .confirmed(commandID):
+            // Canonical history owns the message row; only its outbox badge
+            // and command mapping disappear.
+            self.clearOutboxState(forCommandID: commandID)
+        }
+    }
+
+    private func finishOutboxCancellation(_ commandID: String) {
+        // Loads started while cancellation was in flight carry the previous
+        // generation and cannot re-present their stale command snapshot.
+        self.outboxPresentationGeneration &+= 1
+        self.cancelingOutboxCommandIDs.remove(commandID)
     }
 
     private static func outboxDisplayState(for command: OpenClawChatOutboxCommand)

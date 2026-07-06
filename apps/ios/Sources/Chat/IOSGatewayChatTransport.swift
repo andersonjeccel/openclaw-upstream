@@ -10,6 +10,7 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
     static let compactionRequestTimeoutSeconds = 0
     private let gateway: GatewayNodeSession
     private let globalAgentId: String?
+    private let outboxGatewayID: String?
 
     private struct CreateSessionParams: Codable {
         var key: String
@@ -125,10 +126,36 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         }
     }
 
-    init(gateway: GatewayNodeSession, globalAgentId: String? = nil) {
+    init(
+        gateway: GatewayNodeSession,
+        globalAgentId: String? = nil,
+        outboxGatewayID: String? = nil)
+    {
         self.gateway = gateway
         let normalized = globalAgentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         self.globalAgentId = normalized?.isEmpty == false ? normalized : nil
+        let normalizedGatewayID = outboxGatewayID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.outboxGatewayID = normalizedGatewayID?.isEmpty == false ? normalizedGatewayID : nil
+    }
+
+    func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLease? {
+        guard let outboxGatewayID = self.outboxGatewayID,
+              let route = await self.gateway.currentRoute(ifGatewayID: outboxGatewayID)
+        else { return nil }
+        let transport = self
+        return OpenClawChatTransportRouteLease(
+            sendMessage: { sessionKey, message, thinking, idempotencyKey, attachments in
+                try await transport.sendMessage(
+                    sessionKey: sessionKey,
+                    message: message,
+                    thinking: thinking,
+                    idempotencyKey: idempotencyKey,
+                    attachments: attachments,
+                    ifCurrentRoute: route)
+            },
+            requestHistory: { sessionKey in
+                try await transport.requestHistory(sessionKey: sessionKey, ifCurrentRoute: route)
+            })
     }
 
     static func agentWaitRequestTimeoutSeconds(timeoutMs: Int) -> Int {

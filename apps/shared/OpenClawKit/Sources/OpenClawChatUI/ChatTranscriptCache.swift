@@ -7,6 +7,48 @@ import UIKit
 
 private let cacheLogger = Logger(subsystem: "ai.openclaw", category: "OpenClawChatTranscriptCache")
 
+private final class OutboxChangeHub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: AsyncStream<OpenClawChatOutboxChange>.Continuation] = [:]
+
+    func stream() -> AsyncStream<OpenClawChatOutboxChange> {
+        let id = UUID()
+        let pair = AsyncStream<OpenClawChatOutboxChange>.makeStream()
+        self.lock.lock()
+        self.continuations[id] = pair.continuation
+        self.lock.unlock()
+        pair.continuation.onTermination = { [weak self] _ in
+            self?.remove(id)
+        }
+        return pair.stream
+    }
+
+    func yield(_ change: OpenClawChatOutboxChange) {
+        self.lock.lock()
+        let continuations = Array(self.continuations.values)
+        self.lock.unlock()
+        for continuation in continuations {
+            continuation.yield(change)
+        }
+    }
+
+    func finish() {
+        self.lock.lock()
+        let continuations = Array(self.continuations.values)
+        self.continuations.removeAll()
+        self.lock.unlock()
+        for continuation in continuations {
+            continuation.finish()
+        }
+    }
+
+    private func remove(_ id: UUID) {
+        self.lock.lock()
+        self.continuations.removeValue(forKey: id)
+        self.lock.unlock()
+    }
+}
+
 /// Read-only offline cache seam for chat sessions and transcripts.
 ///
 /// The cache only pre-paints cold opens and covers offline browsing; connected
@@ -73,6 +115,11 @@ public enum OpenClawChatOutboxUpdateResult: Equatable, Sendable {
     case unavailable
 }
 
+public enum OpenClawChatOutboxChange: Equatable, Sendable {
+    case canceled(id: String)
+    case confirmed(id: String)
+}
+
 /// Durable offline outbox for chat commands, scoped to one gateway identity
 /// exactly like the transcript cache. Implementations persist queued sends so
 /// they survive app restarts and flush on reconnect.
@@ -100,7 +147,36 @@ public protocol OpenClawChatCommandOutbox: Sendable {
     /// expired row can send again (retry is new intent, so it also moves the
     /// command to the queue tail rather than replaying its old position).
     func markCommandRetried(id: String) async
+    /// User cancellation succeeds only before a sender claims the row. The
+    /// status predicate is the cross-view-model cancellation boundary.
+    func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult
+    /// Canonical gateway history may complete any row, including a sending
+    /// row whose request ACK was lost.
+    func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult
+    /// Legacy unconditional deletion seam. Retained for source compatibility;
+    /// new UI cancellation must use `cancelCommand` so a claimed send wins.
     func deleteCommand(id: String) async
+    /// Cross-view-model invalidation. Legacy conformers get a finished stream
+    /// and retain their existing single-view behavior.
+    func changes() -> AsyncStream<OpenClawChatOutboxChange>
+}
+
+extension OpenClawChatCommandOutbox {
+    public func cancelCommand(id _: String) async -> OpenClawChatOutboxUpdateResult {
+        // A legacy conformer cannot prove atomic status eligibility. Refuse
+        // cancellation instead of hiding a row whose send may still land.
+        .unavailable
+    }
+
+    public func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        // Canonical gateway history makes unconditional legacy deletion safe.
+        await self.deleteCommand(id: id)
+        return .updated
+    }
+
+    public func changes() -> AsyncStream<OpenClawChatOutboxChange> {
+        AsyncStream { $0.finish() }
+    }
 }
 
 /// SQLite-backed transcript cache for one gateway identity. Owners should use
@@ -156,10 +232,11 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     }
 
     private let databaseURL: URL
-    private let gatewayID: String
+    public nonisolated let gatewayID: String
     private var db: Connection?
     private var isRetired = false
     private var hasRecoveredInterruptedSends = false
+    private nonisolated let outboxChangeHub = OutboxChangeHub()
     /// Existing database failures preserve persistent outbox bytes and make
     /// this store a no-op; an explicit owner purge remains the recovery path.
     private var isBroken = false
@@ -281,9 +358,14 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         // no-op. Closing the handle lets the owner delete the whole cache file.
         self.isRetired = true
         self.db = nil
+        self.outboxChangeHub.finish()
     }
 
     // MARK: - OpenClawChatCommandOutbox
+
+    public nonisolated func changes() -> AsyncStream<OpenClawChatOutboxChange> {
+        self.outboxChangeHub.stream()
+    }
 
     public func enqueueCommand(_ command: OpenClawChatOutboxCommand) async -> Bool {
         guard !self.isRetired, let db = await self.handle() else { return false }
@@ -404,12 +486,39 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             bindings: [self.gatewayID, id, Date().timeIntervalSince1970])
     }
 
-    public func deleteCommand(id: String) async {
-        guard !self.isRetired, let db = await self.handle() else { return }
-        self.execute(
+    public func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        guard !self.isRetired, let db = await self.handle() else { return .unavailable }
+        guard self.execute(
+            db,
+            sql: """
+            DELETE FROM outbox_commands
+            WHERE gateway_id = ?1 AND client_uuid = ?2 AND status IN ('queued', 'failed')
+            """,
+            bindings: [self.gatewayID, id])
+        else { return .unavailable }
+        guard sqlite3_changes(db) > 0 else { return .missing }
+        self.emitOutboxChange(.canceled(id: id))
+        return .updated
+    }
+
+    public func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        guard !self.isRetired, let db = await self.handle() else { return .unavailable }
+        guard self.execute(
             db,
             sql: "DELETE FROM outbox_commands WHERE gateway_id = ?1 AND client_uuid = ?2",
             bindings: [self.gatewayID, id])
+        else { return .unavailable }
+        guard sqlite3_changes(db) > 0 else { return .missing }
+        self.emitOutboxChange(.confirmed(id: id))
+        return .updated
+    }
+
+    public func deleteCommand(id: String) async {
+        _ = await self.confirmCommand(id: id)
+    }
+
+    private func emitOutboxChange(_ change: OpenClawChatOutboxChange) {
+        self.outboxChangeHub.yield(change)
     }
 
     private func updateCommandStatus(id: String, status: String, retryCount: Int, lastError: String?) async {
@@ -427,7 +536,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         // Old queued work is no longer safe to send automatically. Likewise,
         // an acknowledged row that never appeared in canonical history needs
         // an explicit user decision rather than a potentially duplicate replay.
-        return self.execute(
+        self.execute(
             db,
             sql: """
             UPDATE outbox_commands

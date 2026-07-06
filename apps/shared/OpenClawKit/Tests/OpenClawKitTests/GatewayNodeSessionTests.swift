@@ -468,7 +468,8 @@ struct GatewayNodeSessionTests {
             clientId: "openclaw-ios-test",
             clientMode: "node",
             clientDisplayName: "iOS Test",
-            includeDeviceIdentity: false)
+            includeDeviceIdentity: false,
+            deviceAuthGatewayID: "gw-a")
 
         try await gateway.connect(
             url: #require(URL(string: "ws://first.example.invalid")),
@@ -480,7 +481,8 @@ struct GatewayNodeSessionTests {
             onConnected: {},
             onDisconnected: { _ in },
             onInvoke: { req in BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: nil, error: nil) })
-        let firstRoute = try #require(await gateway.currentRoute())
+        let firstRoute = try #require(await gateway.currentRoute(ifGatewayID: "gw-a"))
+        #expect(await gateway.currentRoute(ifGatewayID: "GW-A") == nil)
 
         try await gateway.connect(
             url: #require(URL(string: "ws://second.example.invalid")),

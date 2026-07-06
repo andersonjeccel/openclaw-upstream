@@ -196,7 +196,9 @@ struct ChatProTab: View {
         let offlineStore = self.appModel.makeChatOfflineStore()
         return OpenClawChatViewModel(
             sessionKey: sessionKey,
-            transport: self.appModel.makeChatTransport(),
+            // Bind durable rows and their transport lease to the exact same
+            // gateway owner even if app state switches between these calls.
+            transport: self.appModel.makeChatTransport(outboxGatewayID: offlineStore?.gatewayID),
             activeAgentId: self.activeAgentID,
             transcriptCache: offlineStore,
             outbox: offlineStore,

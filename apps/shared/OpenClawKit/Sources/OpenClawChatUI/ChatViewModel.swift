@@ -78,10 +78,12 @@ public final class OpenClawChatViewModel {
     var isFlushingOutbox = false
     @ObservationIgnored
     var isOutboxFlushRequestedWhileActive = false
-    /// Tombstones set synchronously on user delete so an active flush pass
-    /// never sends a command whose bubble the user just removed.
     @ObservationIgnored
-    var deletedOutboxCommandIDs: Set<String> = []
+    var cancelingOutboxCommandIDs: Set<String> = []
+    @ObservationIgnored
+    var outboxPresentationGeneration: UInt64 = 0
+    @ObservationIgnored
+    var outboxChangesTask: Task<Void, Never>?
     /// Backoff between failed flush attempts; internal so tests can shorten it.
     @ObservationIgnored
     var outboxRetryDelaysMs: [UInt64] = [2000, 8000]
@@ -268,12 +270,22 @@ public final class OpenClawChatViewModel {
                 }
             }
         }
+        if let outbox = self.outbox {
+            let changes = outbox.changes()
+            self.outboxChangesTask = Task { [weak self, changes] in
+                for await change in changes {
+                    guard !Task.isCancelled else { return }
+                    self?.handleOutboxChange(change)
+                }
+            }
+        }
     }
 
     deinit {
         self.eventTask?.cancel()
         self.bootstrapTask?.cancel()
         self.outboxRetryTask?.cancel()
+        self.outboxChangesTask?.cancel()
         for (_, task) in self.pendingRunTimeoutTasks {
             task.cancel()
         }
@@ -564,7 +576,7 @@ public final class OpenClawChatViewModel {
         })
         nextMessages = Self.dedupeMessages(nextMessages)
         self.replaceMessages(nextMessages)
-        self.confirmOutboxCommands(in: incoming, session: request.session)
+        self.confirmOutboxCommands(in: incoming)
         self.prunePendingLocalUserEchoMessageIDs()
         self.clearProvisionalFinalMarkersAdoptedByHistory(incoming)
         self.pruneProvisionalFinalMessages()
@@ -1784,17 +1796,18 @@ public final class OpenClawChatViewModel {
     }
 
     private func handleSessionMessageEvent(_ payload: OpenClawSessionMessageEventPayload) {
-        if let sessionKey = payload.sessionKey,
-           !self.matchesCurrentSessionKey(incoming: sessionKey, agentId: payload.agentId, current: self.sessionKey)
-        {
-            return
-        }
-
         guard let message = payload.message else { return }
-
         let sanitized = Self.stripInboundMetadata(from: message)
+        let isCurrentSession = payload.sessionKey.map {
+            self.matchesCurrentSessionKey(incoming: $0, agentId: payload.agentId, current: self.sessionKey)
+        } ?? true
+        // Confirmation is gateway-scoped, not presentation-scoped. A flush
+        // can drain session A while session B is visible, and A's event must
+        // still retire its durable row before this handler returns early.
+        self.confirmOutboxCommands(in: [sanitized])
+        guard isCurrentSession else { return }
+
         self.invalidateHistorySnapshots()
-        self.confirmOutboxCommands(in: [sanitized], session: self.currentSessionSnapshot())
         // The active client also receives the gateway's echo of the user turn it
         // just sent. performSend already appended an optimistic row carrying a
         // local client timestamp, while the echo carries a server timestamp, so
@@ -2324,10 +2337,37 @@ public final class OpenClawChatViewModel {
         }.first
     }
 
-    /// Narrow seam for the outbox extension: pull durable history after a
-    /// flush so acked commands reconcile with their queued bubbles.
-    func refreshHistoryAfterOutboxFlush() async {
-        await self.refreshHistoryAfterRun()
+    /// Pull canonical history for every session touched by one route-bound
+    /// outbox pass. Background sessions only retire confirmed rows; the
+    /// visible session also runs the normal reconciliation/cache pipeline.
+    func refreshHistoriesAfterOutboxFlush(
+        sessionKeys: Set<String>,
+        routeLease: OpenClawChatTransportRouteLease) async
+    {
+        for sessionKey in sessionKeys.sorted() {
+            let visibleRequest = sessionKey == self.sessionKey
+                ? self.beginHistoryRequest()
+                : nil
+            do {
+                let payload = try await routeLease.requestHistory(sessionKey: sessionKey)
+                let incoming = Self.decodeMessages(payload.messages ?? [])
+                await self.confirmOutboxCommandsNow(in: incoming)
+                if let visibleRequest {
+                    _ = self.applyHistoryPayload(
+                        payload,
+                        for: visibleRequest,
+                        preservingOptimisticLocalMessages: true)
+                }
+            } catch is CancellationError {
+                // The gateway route changed during confirmation. Keep every
+                // unconfirmed row durable for a later matching reconnect.
+                self.applyTransportHealth(false)
+                return
+            } catch {
+                self.logDiagnostic(
+                    "chat.ui outbox history failed sessionKey=\(sessionKey) error=\(error.localizedDescription)")
+            }
+        }
     }
 
     @discardableResult

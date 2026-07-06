@@ -9,6 +9,44 @@ public enum OpenClawChatTransportEvent: Sendable {
     case seqGap
 }
 
+/// One immutable transport route used by an entire outbox flush. Route-aware
+/// transports bind both sends and confirmation reads to the same connection;
+/// a gateway switch then cancels the old work instead of retargeting it.
+public struct OpenClawChatTransportRouteLease: Sendable {
+    public typealias SendMessage = @Sendable (
+        _ sessionKey: String,
+        _ message: String,
+        _ thinking: String,
+        _ idempotencyKey: String,
+        _ attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
+    public typealias RequestHistory = @Sendable (String) async throws -> OpenClawChatHistoryPayload
+
+    private let sendMessageImpl: SendMessage
+    private let requestHistoryImpl: RequestHistory
+
+    public init(
+        sendMessage: @escaping SendMessage,
+        requestHistory: @escaping RequestHistory)
+    {
+        self.sendMessageImpl = sendMessage
+        self.requestHistoryImpl = requestHistory
+    }
+
+    public func sendMessage(
+        sessionKey: String,
+        message: String,
+        thinking: String,
+        idempotencyKey: String,
+        attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
+    {
+        try await self.sendMessageImpl(sessionKey, message, thinking, idempotencyKey, attachments)
+    }
+
+    public func requestHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload {
+        try await self.requestHistoryImpl(sessionKey)
+    }
+}
+
 public protocol OpenClawChatTransport: Sendable {
     func createSession(
         key: String,
@@ -26,6 +64,10 @@ public protocol OpenClawChatTransport: Sendable {
         thinking: String,
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
+
+    /// Captures the current route for a durable outbox flush. Implementations
+    /// backed by a mutable gateway must override this with route-checked calls.
+    func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLease?
 
     func abortRun(sessionKey: String, runId: String) async throws
     func listSessions(limit: Int?) async throws -> OpenClawChatSessionsListResponse
@@ -52,6 +94,22 @@ public protocol OpenClawChatTransport: Sendable {
 }
 
 extension OpenClawChatTransport {
+    public func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLease? {
+        let transport = self
+        return OpenClawChatTransportRouteLease(
+            sendMessage: { sessionKey, message, thinking, idempotencyKey, attachments in
+                try await transport.sendMessage(
+                    sessionKey: sessionKey,
+                    message: message,
+                    thinking: thinking,
+                    idempotencyKey: idempotencyKey,
+                    attachments: attachments)
+            },
+            requestHistory: { sessionKey in
+                try await transport.requestHistory(sessionKey: sessionKey)
+            })
+    }
+
     public func createSession(
         key _: String,
         label _: String?,

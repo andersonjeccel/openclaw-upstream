@@ -336,8 +336,14 @@ public actor GatewayNodeSession {
         return "\(host):\(port)"
     }
 
-    public func currentRoute() -> GatewayNodeSessionRoute? {
+    public func currentRoute(ifGatewayID expectedGatewayID: String? = nil) -> GatewayNodeSessionRoute? {
         guard self.channel != nil else { return nil }
+        if let expectedGatewayID {
+            let expected = expectedGatewayID.trimmingCharacters(in: .whitespacesAndNewlines)
+            let current = self.connectOptions?.deviceAuthGatewayID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !expected.isEmpty, current == expected else { return nil }
+        }
         return GatewayNodeSessionRoute(channelGeneration: self.channelGeneration)
     }
 

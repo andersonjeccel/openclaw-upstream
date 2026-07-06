@@ -408,6 +408,19 @@ struct ChatCommandOutboxStoreTests {
         #expect(await store.claimNextCommand()?.id == "c-2")
     }
 
+    @Test func `user cancellation cannot delete a claimed command`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-1", text: "claimed")))
+        #expect(await store.claimNextCommand()?.id == "c-1")
+
+        #expect(await store.cancelCommand(id: "c-1") == .missing)
+        #expect(await store.loadCommands().map(\.status) == [.sending])
+        #expect(await store.confirmCommand(id: "c-1") == .updated)
+        #expect(await store.loadCommands().isEmpty)
+    }
+
     @Test func `interrupted sending rows revert to queued on recovery`() async throws {
         let url = try makeDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -477,7 +490,7 @@ struct ChatCommandOutboxStoreTests {
         #expect(await store.loadCommands().count == bound)
 
         // Deleting a row frees capacity again.
-        await store.deleteCommand(id: "c-0")
+        #expect(await store.cancelCommand(id: "c-0") == .updated)
         #expect(await store.enqueueCommand(outboxCommand(id: "c-after-delete", text: "fits now")))
     }
 
@@ -492,7 +505,7 @@ struct ChatCommandOutboxStoreTests {
 
         // Cross-gateway mutations must not leak either.
         await storeB.markCommandFailed(id: "c-a", retryCount: 3, lastError: "boom")
-        await storeB.deleteCommand(id: "c-a")
+        #expect(await storeB.cancelCommand(id: "c-a") == .missing)
         let survivors = await storeA.loadCommands()
         #expect(survivors.map(\.id) == ["c-a"])
         #expect(survivors.map(\.status) == [.queued])
@@ -516,7 +529,7 @@ struct ChatCommandOutboxStoreTests {
         #expect(loaded.map(\.retryCount) == [3])
         #expect(loaded.map(\.lastError) == ["gave up"])
 
-        await store.deleteCommand(id: "c-1")
+        #expect(await store.cancelCommand(id: "c-1") == .updated)
         #expect(await store.loadCommands().isEmpty)
     }
 }

@@ -36,6 +36,7 @@ private struct OutboxSendError: Error, LocalizedError {
 
 private actor OutboxTransportState {
     var healthy: Bool
+    var routeGeneration = 0
     var sendFails: Bool
     var sendRejects = false
     var sendResponseErrors = false
@@ -66,6 +67,10 @@ private actor OutboxTransportState {
 
     func setHealthy(_ healthy: Bool) {
         self.healthy = healthy
+    }
+
+    func replaceRoute() {
+        self.routeGeneration += 1
     }
 
     func setSendFails(_ fails: Bool) {
@@ -113,6 +118,16 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
     }
 
     func requestHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload {
+        try await self.requestHistory(sessionKey: sessionKey, expectedRoute: nil)
+    }
+
+    private func requestHistory(
+        sessionKey: String,
+        expectedRoute: Int?) async throws -> OpenClawChatHistoryPayload
+    {
+        if let expectedRoute, await self.state.routeGeneration != expectedRoute {
+            throw CancellationError()
+        }
         guard await self.state.healthy, await !self.state.historyFails else { throw OutboxSendError() }
         if let stale = await self.state.staleHistoryRows {
             // Gateway lag: the snapshot predates the just-acked send.
@@ -149,11 +164,32 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
         idempotencyKey: String,
         attachments _: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
     {
+        try await self.sendMessage(
+            sessionKey: sessionKey,
+            message: message,
+            thinking: thinking,
+            idempotencyKey: idempotencyKey,
+            expectedRoute: nil)
+    }
+
+    private func sendMessage(
+        sessionKey: String,
+        message: String,
+        thinking: String,
+        idempotencyKey: String,
+        expectedRoute: Int?) async throws -> OpenClawChatSendResponse
+    {
+        if let expectedRoute, await self.state.routeGeneration != expectedRoute {
+            throw CancellationError()
+        }
         if let gate = await self.state.heldSendGate {
             // One-shot: only the first send is held so tests can pin the
             // window where the flush is mid-drain.
             await self.state.setHeldSendGate(nil)
             await gate.wait()
+        }
+        if let expectedRoute, await self.state.routeGeneration != expectedRoute {
+            throw CancellationError()
         }
         if await self.state.sendFails {
             throw OutboxSendError()
@@ -175,6 +211,25 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
             idempotencyKey: idempotencyKey,
             thinking: thinking)
         return OpenClawChatSendResponse(runId: idempotencyKey, status: "accepted")
+    }
+
+    func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLease? {
+        let expectedRoute = await self.state.routeGeneration
+        let transport = self
+        return OpenClawChatTransportRouteLease(
+            sendMessage: { sessionKey, message, thinking, idempotencyKey, _ in
+                try await transport.sendMessage(
+                    sessionKey: sessionKey,
+                    message: message,
+                    thinking: thinking,
+                    idempotencyKey: idempotencyKey,
+                    expectedRoute: expectedRoute)
+            },
+            requestHistory: { sessionKey in
+                try await transport.requestHistory(
+                    sessionKey: sessionKey,
+                    expectedRoute: expectedRoute)
+            })
     }
 
     /// Gated model patch: `setSessionModel` blocks until `releaseModelPatch`
@@ -287,6 +342,88 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
 
     func markCommandRetried(id: String) async {
         await self.base.markCommandRetried(id: id)
+    }
+
+    func deleteCommand(id: String) async {
+        await self.base.deleteCommand(id: id)
+    }
+}
+
+/// Returns one already-read command snapshot only after the test releases it,
+/// reproducing a restore that resumes after another view canceled the row.
+private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
+    private nonisolated let base: OpenClawChatSQLiteTranscriptCache
+    private var captured = DeleteGate()
+    private var release = DeleteGate()
+    private var shouldHoldNextLoad = false
+
+    init(base: OpenClawChatSQLiteTranscriptCache) {
+        self.base = base
+    }
+
+    func waitUntilSnapshotCaptured() async {
+        await self.captured.wait()
+    }
+
+    func holdNextLoad() {
+        self.captured = DeleteGate()
+        self.release = DeleteGate()
+        self.shouldHoldNextLoad = true
+    }
+
+    func releaseSnapshot() async {
+        await self.release.open()
+    }
+
+    nonisolated func changes() -> AsyncStream<OpenClawChatOutboxChange> {
+        self.base.changes()
+    }
+
+    func enqueueCommand(_ command: OpenClawChatOutboxCommand) async -> Bool {
+        await self.base.enqueueCommand(command)
+    }
+
+    func loadCommands() async -> [OpenClawChatOutboxCommand] {
+        let commands = await self.base.loadCommands()
+        if self.shouldHoldNextLoad {
+            self.shouldHoldNextLoad = false
+            await self.captured.open()
+            await self.release.wait()
+        }
+        return commands
+    }
+
+    @discardableResult
+    func recoverInterruptedSends() async -> Bool {
+        await self.base.recoverInterruptedSends()
+    }
+
+    func claimNextCommand() async -> OpenClawChatOutboxCommand? {
+        await self.base.claimNextCommand()
+    }
+
+    func markCommandQueued(id: String, retryCount: Int, lastError: String?) async {
+        await self.base.markCommandQueued(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.markCommandAwaitingConfirmation(id: id)
+    }
+
+    func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
+        await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandRetried(id: String) async {
+        await self.base.markCommandRetried(id: id)
+    }
+
+    func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.cancelCommand(id: id)
+    }
+
+    func confirmCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.confirmCommand(id: id)
     }
 
     func deleteCommand(id: String) async {
@@ -684,15 +821,11 @@ struct ChatViewModelOutboxTests {
 
         await MainActor.run { vm.load() }
         await transport.goOnline()
-        try await waitUntil("background send awaits its history") {
-            await store.loadCommands().map(\.status) == [.awaitingConfirmation]
-        }
-        #expect(await transport.state.sentThinkingLevels == ["high"])
-        #expect(await transport.state.sentSessionKeys == ["other-session"])
-        await MainActor.run { vm.switchSession(to: "other-session") }
         try await waitUntil("background send confirmed") {
             await store.loadCommands().isEmpty
         }
+        #expect(await transport.state.sentThinkingLevels == ["high"])
+        #expect(await transport.state.sentSessionKeys == ["other-session"])
     }
 
     @Test func `flushed background-session turn is spliced into its cached transcript`() async throws {
@@ -715,8 +848,8 @@ struct ChatViewModelOutboxTests {
 
         await MainActor.run { vm.load() }
         await transport.goOnline()
-        try await waitUntil("background send awaits its history") {
-            await store.loadCommands().map(\.status) == [.awaitingConfirmation]
+        try await waitUntil("background send confirmed without opening its session") {
+            await store.loadCommands().isEmpty
         }
 
         // The turn survives in that session's cached transcript even though
@@ -724,8 +857,42 @@ struct ChatViewModelOutboxTests {
         let cached = await store.loadTranscript(sessionKey: "other-session")
         #expect(cached.map { $0.content.compactMap(\.text).joined() } == ["sent from elsewhere"])
         #expect(cached.map(\.idempotencyKey) == ["c-background:user"])
-        await MainActor.run { vm.switchSession(to: "other-session") }
-        try await waitUntil("background send confirmed") {
+    }
+
+    @Test func `background canonical alias event confirms by idempotency key`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        #expect(await store.enqueueCommand(outboxTestCommand(
+            id: "c-alias",
+            text: "canonical alias",
+            createdAt: Date().timeIntervalSince1970)))
+        #expect(await store.claimNextCommand()?.id == "c-alias")
+        #expect(await store.markCommandAwaitingConfirmation(id: "c-alias") == .updated)
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run {
+            vm.load()
+            vm.switchSession(to: "other-session")
+        }
+
+        transport.emit(.sessionMessage(OpenClawSessionMessageEventPayload(
+            sessionKey: "agent:main:main",
+            agentId: "main",
+            message: OpenClawChatMessage(
+                role: "user",
+                content: [OpenClawChatMessageContent(
+                    type: "text",
+                    text: "canonical alias",
+                    mimeType: nil,
+                    fileName: nil,
+                    content: nil)],
+                timestamp: 1,
+                idempotencyKey: "c-alias:user"),
+            messageId: "message-c-alias",
+            messageSeq: 1)))
+
+        try await waitUntil("canonical alias confirms background command") {
             await store.loadCommands().isEmpty
         }
     }
@@ -825,72 +992,6 @@ struct ChatViewModelOutboxTests {
         try await waitUntil("durable row deleted") {
             await store.loadCommands().isEmpty
         }
-    }
-}
-
-/// Holds `deleteCommand` until released so tests can pin the exact window
-/// where a user delete races an in-flight flush pass (row still visible in
-/// the pass's snapshot).
-private final class HeldDeleteOutbox: @unchecked Sendable, OpenClawChatCommandOutbox {
-    private let base: OpenClawChatSQLiteTranscriptCache
-    private let gate = DeleteGate()
-
-    init(base: OpenClawChatSQLiteTranscriptCache) {
-        self.base = base
-    }
-
-    func releaseHeldDeletes() async {
-        await self.gate.open()
-    }
-
-    /// Fired (once) just before the claim forwards, on the flush's task:
-    /// lets tests land a user delete inside the claim's await window.
-    private var onClaim: (@Sendable () async -> Void)?
-
-    func setOnClaim(_ hook: @escaping @Sendable () async -> Void) {
-        self.onClaim = hook
-    }
-
-    func enqueueCommand(_ command: OpenClawChatOutboxCommand) async -> Bool {
-        await self.base.enqueueCommand(command)
-    }
-
-    func loadCommands() async -> [OpenClawChatOutboxCommand] {
-        await self.base.loadCommands()
-    }
-
-    @discardableResult
-    func recoverInterruptedSends() async -> Bool {
-        await self.base.recoverInterruptedSends()
-    }
-
-    func claimNextCommand() async -> OpenClawChatOutboxCommand? {
-        if let hook = self.onClaim {
-            self.onClaim = nil
-            await hook()
-        }
-        return await self.base.claimNextCommand()
-    }
-
-    func markCommandQueued(id: String, retryCount: Int, lastError: String?) async {
-        await self.base.markCommandQueued(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
-    func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult {
-        await self.base.markCommandAwaitingConfirmation(id: id)
-    }
-
-    func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
-        await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
-    }
-
-    func markCommandRetried(id: String) async {
-        await self.base.markCommandRetried(id: id)
-    }
-
-    func deleteCommand(id: String) async {
-        await self.gate.wait()
-        await self.base.deleteCommand(id: id)
     }
 }
 
@@ -1138,74 +1239,158 @@ extension ChatViewModelOutboxTests {
         ])
     }
 
-    @Test func `deleting during the claim await never sends`() async throws {
+    @Test func `a stale second view model cannot cancel a claimed send`() async throws {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
-        let outbox = HeldDeleteOutbox(base: store)
         let transport = OutboxTestTransport(healthy: false)
-        let vm = await makeOutboxViewModel(transport: transport, outbox: outbox)
+        let sender = await makeOutboxViewModel(transport: transport, outbox: store)
 
-        await MainActor.run { vm.load() }
-        try await sendWhileOffline(vm, text: "deleted inside the claim")
-        let messageID = try #require(await MainActor.run {
-            vm.messages.first { vm.outboxState(for: $0.id) == .queued }?.id
-        })
-
-        // The delete lands inside claimNextCommand's await window. The
-        // post-claim tombstone check must catch it.
-        outbox.setOnClaim {
-            await MainActor.run { vm.deleteOutboxMessage(messageID) }
+        await MainActor.run { sender.load() }
+        try await sendWhileOffline(sender, text: "already claimed")
+        let observer = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run { observer.load() }
+        try await waitUntil("second view model restores queued bubble") {
+            await MainActor.run { queuedStateCount(observer) == 1 }
         }
+
+        let sendGate = DeleteGate()
+        await transport.state.setHeldSendGate(sendGate)
         await transport.goOnline()
-        // The recheck path awaits the (held) durable delete, so give the
-        // flush a beat to reach it and prove nothing was sent meanwhile.
-        try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(await transport.state.sentIdempotencyKeys.isEmpty)
-        await outbox.releaseHeldDeletes()
-        try await waitUntil("flush drains without sending") {
-            await MainActor.run { queuedStateCount(vm) == 0 }
+        try await waitUntil("first view model claims row") {
+            await store.loadCommands().map(\.status) == [.sending]
         }
-        #expect(await transport.state.sentIdempotencyKeys.isEmpty)
-        try await waitUntil("durable row deleted") {
+        let messageID = try #require(await MainActor.run {
+            observer.messages.first { observer.outboxState(for: $0.id) == .queued }?.id
+        })
+        await MainActor.run { observer.deleteOutboxMessage(messageID) }
+        try await waitUntil("observer adopts sending status") {
+            await MainActor.run { observer.outboxState(for: messageID) == .sending }
+        }
+        #expect(await store.loadCommands().map(\.status) == [.sending])
+
+        await sendGate.open()
+        try await waitUntil("claimed send confirms") {
             await store.loadCommands().isEmpty
         }
+        #expect(await transport.state.sentMessages == ["already claimed"])
     }
 
-    @Test func `deleting a queued bubble mid-flush never sends it`() async throws {
+    @Test func `both view models remove a command canceled by either one`() async throws {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
-        let outbox = HeldDeleteOutbox(base: store)
         let transport = OutboxTestTransport(healthy: false)
-        let vm = await makeOutboxViewModel(transport: transport, outbox: outbox)
+        let first = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { first.load() }
+        try await sendWhileOffline(first, text: "cancel everywhere")
+        let second = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run { second.load() }
+        try await waitUntil("both views show queued command") {
+            await MainActor.run { queuedStateCount(first) == 1 && queuedStateCount(second) == 1 }
+        }
+
+        let firstID = try #require(await MainActor.run { first.messages.last?.id })
+        let secondID = try #require(await MainActor.run { second.messages.last?.id })
+        await MainActor.run { first.deleteOutboxMessage(firstID) }
+        try await waitUntil("first view cancels durable row") {
+            let rowsEmpty = await store.loadCommands().isEmpty
+            let textEmpty = await userTexts(first).isEmpty
+            return rowsEmpty && textEmpty
+        }
+
+        await MainActor.run { second.deleteOutboxMessage(secondID) }
+        try await waitUntil("second view removes stale canceled bubble") {
+            await userTexts(second).isEmpty
+        }
+        #expect(await transport.state.sentMessages.isEmpty)
+    }
+
+    @Test func `cancellation invalidates another views in flight restore snapshot`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false)
+        let cancelingView = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { cancelingView.load() }
+        try await sendWhileOffline(cancelingView, text: "stale snapshot")
+        #expect(await store.enqueueCommand(outboxTestCommand(
+            id: "c-survivor",
+            text: "survivor",
+            createdAt: Date().timeIntervalSince1970 + 1)))
+        let staleOutbox = SnapshotHoldingOutbox(base: store)
+        await staleOutbox.holdNextLoad()
+        let staleView = await MainActor.run {
+            OpenClawChatViewModel(sessionKey: "main", transport: transport, outbox: staleOutbox)
+        }
+        await MainActor.run { staleView.load() }
+        await staleOutbox.waitUntilSnapshotCaptured()
+
+        let messageID = try #require(await MainActor.run { cancelingView.messages.last?.id })
+        await MainActor.run { cancelingView.deleteOutboxMessage(messageID) }
+        try await waitUntil("durable cancellation broadcasts") {
+            await store.loadCommands().map(\.id) == ["c-survivor"]
+        }
+        await staleOutbox.releaseSnapshot()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        try await waitUntil("invalidated restore reloads surviving command") {
+            await userTexts(staleView) == ["survivor"]
+        }
+        #expect(await MainActor.run { queuedStateCount(staleView) } == 1)
+        #expect(await transport.state.sentMessages.isEmpty)
+    }
+
+    @Test func `confirmation invalidates cancellation claimed row reload`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let outbox = SnapshotHoldingOutbox(base: store)
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await MainActor.run {
+            OpenClawChatViewModel(sessionKey: "main", transport: transport, outbox: outbox)
+        }
 
         await MainActor.run { vm.load() }
-        try await sendWhileOffline(vm, text: "changed my mind mid-flush")
-
-        // User deletes the bubble; the durable row deletion is held, so the
-        // next flush pass still sees the row in its snapshot — the exact
-        // race window the tombstone protects.
-        let messageID = try #require(await MainActor.run {
-            vm.messages.first { vm.outboxState(for: $0.id) == .queued }?.id
-        })
+        try await sendWhileOffline(vm, text: "confirmed during delete")
+        let command = try #require(await store.claimNextCommand())
+        let messageID = try #require(await MainActor.run { vm.messages.last?.id })
+        await outbox.holdNextLoad()
         await MainActor.run { vm.deleteOutboxMessage(messageID) }
+        await outbox.waitUntilSnapshotCaptured()
 
+        #expect(await store.confirmCommand(id: command.id) == .updated)
+        await outbox.releaseSnapshot()
+        try await waitUntil("confirmation clears stale sending badge") {
+            await MainActor.run { vm.outboxState(for: messageID) == nil }
+        }
+        #expect(await userTexts(vm) == ["confirmed during delete"])
+    }
+
+    @Test func `route replacement cannot retarget a claimed command`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "belongs to the old route")
+        let sendGate = DeleteGate()
+        await transport.state.setHeldSendGate(sendGate)
         await transport.goOnline()
-        try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(await transport.state.sentIdempotencyKeys.isEmpty)
+        try await waitUntil("old route claims command") {
+            await store.loadCommands().map(\.status) == [.sending]
+        }
 
-        // The bubble remains until durable deletion completes. Once released,
-        // the row is gone for good and a later flush still sends nothing.
-        #expect(await MainActor.run { queuedStateCount(vm) } == 1)
-        await outbox.releaseHeldDeletes()
-        try await waitUntil("durable row deleted") {
-            await store.loadCommands().isEmpty
+        await transport.state.replaceRoute()
+        await sendGate.open()
+        try await waitUntil("route cancellation requeues command") {
+            await store.loadCommands().map(\.status) == [.queued]
         }
-        try await waitUntil("outbox state cleared") {
-            await MainActor.run { queuedStateCount(vm) == 0 }
-        }
-        transport.emit(.health(ok: true))
-        #expect(await transport.state.sentIdempotencyKeys.isEmpty)
+        #expect(await transport.state.sentMessages.isEmpty)
+        #expect(await MainActor.run { !vm.healthOK })
     }
 }

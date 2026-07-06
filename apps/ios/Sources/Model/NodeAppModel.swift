@@ -329,7 +329,7 @@ final class NodeAppModel {
         return self.isOperatorGatewayConnected ? "operator" : "offline"
     }
 
-    func makeChatTransport() -> any OpenClawChatTransport {
+    func makeChatTransport(outboxGatewayID: String? = nil) -> any OpenClawChatTransport {
         if self.isScreenshotFixtureModeEnabled {
             return LocalFixtureChatTransport(fixture: .appScreenshots)
         }
@@ -338,7 +338,8 @@ final class NodeAppModel {
         }
         return IOSGatewayChatTransport(
             gateway: self.operatorSession,
-            globalAgentId: self.chatAgentId)
+            globalAgentId: self.chatAgentId,
+            outboxGatewayID: outboxGatewayID)
     }
 
     /// Gateway identity the transcript cache is scoped to: the active
