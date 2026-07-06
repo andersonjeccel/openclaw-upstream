@@ -298,10 +298,12 @@ struct RootTabsSourceGuardTests {
         #expect(!aboutDestination.contains("SettingsDetailRow(\"Version\""))
         #expect(!aboutDestination.contains("SettingsDetailRow(\"Platform\""))
         #expect(!aboutDestination.contains("SettingsDetailRow(\"Model\""))
-        #expect(diagnosticsDestination.contains("SettingsDetailRow(\"Device\", value: DeviceInfoHelper.deviceFamily())"))
+        #expect(diagnosticsDestination
+            .contains("SettingsDetailRow(\"Device\", value: DeviceInfoHelper.deviceFamily())"))
         #expect(diagnosticsDestination
             .contains("SettingsDetailRow(\"Platform\", value: DeviceInfoHelper.platformStringForDisplay())"))
-        #expect(diagnosticsDestination.contains("SettingsDetailRow(\"Model\", value: DeviceInfoHelper.modelIdentifier())"))
+        #expect(diagnosticsDestination
+            .contains("SettingsDetailRow(\"Model\", value: DeviceInfoHelper.modelIdentifier())"))
     }
 
     @Test func `routed headers use shared adaptive layout`() throws {
@@ -889,7 +891,7 @@ struct RootTabsSourceGuardTests {
         #expect(rootSource.contains("self.appModel.gatewayProblemReportCount"))
         #expect(rootSource.contains("GatewayToastShakeEffect"))
 
-        #expect(actionsSource.contains("await self.gatewayController.connectLastKnown()"))
+        #expect(actionsSource.contains("await self.gatewayController.connectActiveGateway()"))
         #expect(actionsSource.contains("self.gatewayController.refreshActiveGatewayRegistrationFromSettings()"))
         #expect(actionsSource.contains("self.gatewayController.restartDiscovery()"))
         #expect(actionsSource.contains("await self.appModel.refreshGatewayOverviewIfConnected()"))
@@ -914,7 +916,7 @@ struct RootTabsSourceGuardTests {
         #expect(rootSource.contains("GatewayOnboardingReset.reset(appModel: self.appModel, instanceId: instanceId)"))
         #expect(rootSource.contains("self.gatewayController.trustRotatedGatewayCertificate(from: problem)"))
         #expect(rootSource.contains("GatewayProblemPrimaryAction.openProtocolMismatchHelpIfNeeded(problem)"))
-        #expect(rootSource.contains("await self.gatewayController.connectLastKnown()"))
+        #expect(rootSource.contains("await self.gatewayController.connectActiveGateway()"))
 
         #expect(rootSource.contains("GatewayProblemDetailsSheet("))
         #expect(onboardingSetupOwnerGuard.lowerBound < consumedGatewaySetup.lowerBound)

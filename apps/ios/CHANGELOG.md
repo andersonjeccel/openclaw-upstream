@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added multi-gateway support: the app remembers every paired gateway, shows them in Settings with a quick switcher, and switches between them without pairing again. Credentials, TLS trust, and cached chats stay scoped to their gateway, push registration follows the active gateway, and forgetting a gateway removes all of its stored state.
 - Fixed Apple Watch connection setup so pairing and companion-install changes refresh immediately and cold launches wait for WatchConnectivity activation before sending.
 - Redesigned the Settings About screen with the animated mascot, app tagline, and Website/Docs/GitHub/Discord links.
 - Fixed startup aborts caused by inactive Voice Wake initializing the simulator audio pipeline.
