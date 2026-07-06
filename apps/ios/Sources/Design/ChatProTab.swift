@@ -17,6 +17,7 @@ struct ChatProTab: View {
     // Track the real agent separately so gateway metadata always rebuilds it.
     @State private var viewModelTransportAgentID = ""
     @State private var viewModelAgentID = ""
+    @State private var speech: OpenClawChatSpeechController?
     let headerLeadingAction: OpenClawSidebarHeaderAction?
     let headerTitle: String?
     let showsAgentBadge: Bool
@@ -51,6 +52,12 @@ struct ChatProTab: View {
         }
         .task {
             self.syncChatViewModel()
+            if self.speech == nil {
+                let gateway = self.appModel.operatorSession
+                self.speech = OpenClawChatSpeechController { text in
+                    try await ChatMessageSpeechClient.synthesize(text: text, gateway: gateway)
+                }
+            }
         }
         .onChange(of: self.appModel.chatSessionKey) { _, _ in
             self.syncChatViewModel()
@@ -137,7 +144,8 @@ struct ChatProTab: View {
                 messagePlaceholder: self.messagePlaceholder,
                 emptyAssistantIntro: String(localized: "What would you like to work on?"),
                 emptyAssistantPrompts: Self.emptyAssistantPrompts,
-                talkControl: self.talkControl)
+                talkControl: self.talkControl,
+                speech: self.speech)
                 // iMessage-style grey bubbles for agent replies in the clean chrome.
                     .environment(\.openClawAssistantBubblesInCleanChrome, true)
                     .id(ObjectIdentifier(viewModel))
