@@ -420,6 +420,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
                         thinkingSignature: nil,
                         mimeType: item.mimeType,
                         fileName: item.fileName,
+                        durationSeconds: item.durationSeconds,
                         content: nil,
                         id: item.id,
                         name: item.name,

@@ -1092,7 +1092,7 @@ public final class OpenClawChatViewModel {
                 fileName: att.fileName,
                 content: att.data.base64EncodedString())
         }
-        for att in encodedAttachments {
+        for (attachment, att) in zip(self.attachments, encodedAttachments) {
             userContent.append(
                 OpenClawChatMessageContent(
                     type: att.type,
@@ -1101,6 +1101,7 @@ public final class OpenClawChatViewModel {
                     thinkingSignature: nil,
                     mimeType: att.mimeType,
                     fileName: att.fileName,
+                    durationSeconds: attachment.durationSeconds,
                     content: AnyCodable(att.content),
                     id: nil,
                     name: nil,

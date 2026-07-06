@@ -97,6 +97,7 @@ public struct OpenClawChatView: View {
     private let emptyAssistantIntro: String?
     private let emptyAssistantPrompts: [StarterPrompt]
     private let talkControl: OpenClawChatTalkControl?
+    private let voiceNoteControl: OpenClawChatVoiceNoteControl?
 
     private enum ScrollFollowTarget: Equatable {
         case latest
@@ -146,7 +147,8 @@ public struct OpenClawChatView: View {
         messagePlaceholder: String? = nil,
         emptyAssistantIntro: String? = nil,
         emptyAssistantPrompts: [StarterPrompt] = [],
-        talkControl: OpenClawChatTalkControl? = nil)
+        talkControl: OpenClawChatTalkControl? = nil,
+        voiceNoteControl: OpenClawChatVoiceNoteControl? = nil)
     {
         _viewModel = State(initialValue: viewModel)
         self.drawsBackground = drawsBackground
@@ -165,6 +167,7 @@ public struct OpenClawChatView: View {
         self.emptyAssistantIntro = emptyAssistantIntro
         self.emptyAssistantPrompts = emptyAssistantPrompts
         self.talkControl = talkControl
+        self.voiceNoteControl = voiceNoteControl
     }
 
     public var body: some View {
@@ -224,7 +227,8 @@ public struct OpenClawChatView: View {
             composerChrome: self.composerChrome,
             isComposerEnabled: self.isComposerEnabled,
             messagePlaceholder: self.messagePlaceholder,
-            talkControl: self.talkControl)
+            talkControl: self.talkControl,
+            voiceNoteControl: self.voiceNoteControl)
     }
 
     private var messageList: some View {
