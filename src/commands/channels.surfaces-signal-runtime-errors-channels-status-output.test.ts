@@ -130,4 +130,57 @@ describe("channels command", () => {
 
     expect(lines.join("\n")).toContain("transport:");
   });
+
+  it.each([
+    ["ready", "readiness:ready"],
+    ["account_missing", "readiness:account-missing"],
+    ["unreachable", "readiness:daemon-unreachable"],
+    ["receive_unavailable", "readiness:receive-unavailable"],
+  ])("surfaces Signal %s probe readiness in channels status output", (readiness, expected) => {
+    const lines = formatGatewayChannelsStatusLines({
+      channelLabels: {
+        signal: "Signal",
+      },
+      channelAccounts: {
+        signal: [
+          {
+            accountId: "default",
+            enabled: true,
+            configured: true,
+            probe: {
+              ok: readiness === "ready",
+              readiness,
+            },
+          },
+        ],
+      },
+    });
+
+    expect(lines.join("\n")).toContain(expected);
+  });
+
+  it("does not mark account-missing Signal probes as working", () => {
+    const lines = formatGatewayChannelsStatusLines({
+      channelLabels: {
+        signal: "Signal",
+      },
+      channelAccounts: {
+        signal: [
+          {
+            accountId: "default",
+            enabled: true,
+            configured: true,
+            probe: {
+              ok: true,
+              readiness: "account_missing",
+            },
+          },
+        ],
+      },
+    });
+
+    const output = lines.join("\n");
+    expect(output).toContain("readiness:account-missing");
+    expect(output).not.toContain("works");
+  });
 });

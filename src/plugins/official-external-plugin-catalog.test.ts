@@ -1652,7 +1652,6 @@ describe("official external plugin catalog", () => {
       ["mattermost", "@openclaw/mattermost"],
       ["moonshot", "@openclaw/moonshot-provider"],
       ["searxng", "@openclaw/searxng-plugin"],
-      ["signal", "@openclaw/signal"],
       ["sms", "@openclaw/sms"],
       ["tavily", "@openclaw/tavily-plugin"],
       ["tencent", "@openclaw/tencent-provider"],
@@ -1677,6 +1676,12 @@ describe("official external plugin catalog", () => {
         minHostVersion: ">=2026.6.9",
       });
     }
+    expect(resolveOfficialExternalPluginInstall(expectCatalogEntry("signal"))).toMatchObject({
+      clawhubSpec: "clawhub:@openclaw/signal",
+      npmSpec: "@openclaw/signal",
+      defaultChoice: "npm",
+      minHostVersion: ">=2026.6.11",
+    });
   });
 
   it("advertises StepFun with its ClawHub package and plugin API floor", () => {

@@ -2120,13 +2120,57 @@ describe("resolveAccountIdForConfigure", () => {
 
     expect(accountId).toBe("prompted-id");
     const selectCalls = prompter.select.mock.calls as unknown as Array<
-      [{ message?: string; initialValue?: string }]
+      [
+        {
+          message?: string;
+          initialValue?: string;
+          options?: Array<{ value: string; label: string }>;
+        },
+      ]
     >;
     const selectOptions = selectCalls[0]?.[0] as
-      | { message?: string; initialValue?: string }
+      | {
+          message?: string;
+          initialValue?: string;
+          options?: Array<{ value: string; label: string }>;
+        }
       | undefined;
-    expect(selectOptions?.message).toBe("Signal account");
+    expect(selectOptions?.message).toBe("Signal configuration");
     expect(selectOptions?.initialValue).toBe("fallback");
+    expect(selectOptions?.options).toEqual([
+      { value: "default", label: "Primary configuration (default)" },
+      { value: "prompted-id", label: "prompted-id" },
+      { value: "__new__", label: "Add a named configuration" },
+    ]);
     expect(prompter.text).not.toHaveBeenCalled();
+  });
+
+  it("prompts for a configuration name when adding a new account scope", async () => {
+    const prompter = {
+      select: vi.fn(async () => "__new__"),
+      text: vi.fn(async () => "Testing Realm"),
+      note: vi.fn(async () => undefined),
+    };
+
+    const accountId = await resolveAccountIdForConfigure({
+      cfg: {},
+      prompter: prompter as any,
+      label: "Signal",
+      shouldPromptAccountIds: true,
+      listAccountIds: () => ["default"],
+      defaultAccountId: DEFAULT_ACCOUNT_ID,
+    });
+
+    expect(accountId).toBe("testing-realm");
+    expect(prompter.note).toHaveBeenCalledWith(
+      'Normalized account id to "testing-realm".',
+      "Signal configuration",
+    );
+    expect(prompter.text).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Signal configuration name",
+        placeholder: "work",
+      }),
+    );
   });
 });

@@ -501,6 +501,10 @@
       "types": "./dist/plugin-sdk/media-runtime.d.ts",
       "default": "./dist/plugin-sdk/media-runtime.js"
     },
+    "./plugin-sdk/qr-terminal-runtime": {
+      "types": "./dist/plugin-sdk/qr-terminal-runtime.d.ts",
+      "default": "./dist/plugin-sdk/qr-terminal-runtime.js"
+    },
     "./plugin-sdk/media-store": {
       "types": "./dist/plugin-sdk/media-store.d.ts",
       "default": "./dist/plugin-sdk/media-store.js"

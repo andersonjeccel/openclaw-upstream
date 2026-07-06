@@ -601,6 +601,7 @@ export function buildChannelSetupWizardAdapterFromSetupWizard(params: {
         });
       }
 
+      let setupApplied: boolean | undefined;
       if (wizard.finalize) {
         const finalized = await wizard.finalize({
           cfg: next,
@@ -620,6 +621,9 @@ export function buildChannelSetupWizardAdapterFromSetupWizard(params: {
             ...finalized.credentialValues,
           };
         }
+        if (typeof finalized?.setupApplied === "boolean") {
+          setupApplied = finalized.setupApplied;
+        }
       }
 
       const shouldShowCompletionNote =
@@ -635,7 +639,11 @@ export function buildChannelSetupWizardAdapterFromSetupWizard(params: {
         await prompter.note(wizard.completionNote.lines.join("\n"), wizard.completionNote.title);
       }
 
-      return { cfg: next, accountId };
+      return {
+        cfg: next,
+        accountId,
+        ...(setupApplied !== undefined ? { setupApplied } : {}),
+      };
     },
     dmPolicy: wizard.dmPolicy,
     disable: wizard.disable,

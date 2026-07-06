@@ -68,6 +68,13 @@ async function resolveSignalRpcAccountInfo(opts: SignalRpcOpts) {
   });
 }
 
+function resolveSignalRpcApiMode(
+  cfg: OpenClawConfig,
+  accountInfo: Awaited<ReturnType<typeof resolveSignalRpcAccountInfo>>,
+) {
+  return accountInfo?.config.apiMode ?? cfg.channels?.signal?.apiMode;
+}
+
 function parseTarget(raw: string): SignalTarget {
   let value = raw.trim();
   if (!value) {
@@ -173,11 +180,11 @@ export async function sendMessageSignal(
   opts: SignalSendOpts,
 ): Promise<SignalSendResult> {
   const cfg = requireRuntimeConfig(opts.cfg, "Signal send");
-  const apiMode = cfg.channels?.signal?.apiMode;
   const accountInfo = resolveSignalAccount({
     cfg,
     accountId: opts.accountId,
   });
+  const apiMode = accountInfo.config.apiMode;
   const { baseUrl, account } = resolveSignalRpcContext(opts, accountInfo);
   const target = parseTarget(to);
   let message = text ?? "";
@@ -298,7 +305,7 @@ export async function sendTypingSignal(
   await signalRpcRequest("sendTyping", params, {
     baseUrl,
     timeoutMs: opts.timeoutMs,
-    apiMode: cfg.channels?.signal?.apiMode,
+    apiMode: resolveSignalRpcApiMode(cfg, accountInfo),
   });
   return true;
 }
@@ -331,7 +338,7 @@ export async function sendReadReceiptSignal(
   await signalRpcRequest("sendReceipt", params, {
     baseUrl,
     timeoutMs: opts.timeoutMs,
-    apiMode: cfg.channels?.signal?.apiMode,
+    apiMode: resolveSignalRpcApiMode(cfg, accountInfo),
   });
   return true;
 }

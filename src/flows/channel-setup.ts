@@ -52,6 +52,8 @@ import {
   resolveQuickstartDefault,
 } from "./channel-setup.status.js";
 
+const CHANNEL_SETUP_PROGRESS_PAINT_DELAY_MS = 100;
+
 export function createChannelOnboardingPostWriteHookCollector() {
   const hooks = new Map<string, ChannelOnboardingPostWriteHook>();
   return {
@@ -166,14 +168,26 @@ export async function setupChannels(
     if (existing && setup?.forceReload !== true) {
       return existing;
     }
-    const snapshot = loadChannelSetupPluginRegistrySnapshotForChannel({
-      cfg: next,
-      runtime,
-      channel,
-      ...(pluginId ? { pluginId } : {}),
-      workspaceDir: resolveWorkspaceDir(),
-      forceSetupOnlyChannelPlugins: setup?.forceSetupOnlyChannelPlugins ?? true,
-    });
+    const progressMessage = `Preparing ${channel} setup`;
+    const progress = prompter.progress(progressMessage);
+    progress.update(progressMessage);
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, CHANNEL_SETUP_PROGRESS_PAINT_DELAY_MS),
+    );
+    const snapshot = (() => {
+      try {
+        return loadChannelSetupPluginRegistrySnapshotForChannel({
+          cfg: next,
+          runtime,
+          channel,
+          ...(pluginId ? { pluginId } : {}),
+          workspaceDir: resolveWorkspaceDir(),
+          forceSetupOnlyChannelPlugins: setup?.forceSetupOnlyChannelPlugins ?? true,
+        });
+      } finally {
+        progress.stop();
+      }
+    })();
     const plugin =
       snapshot.channelSetups.find((entry) => entry.plugin.id === channel)?.plugin ??
       snapshot.channels.find((entry) => entry.plugin.id === channel)?.plugin;
@@ -419,11 +433,16 @@ export async function setupChannels(
     return true;
   };
 
-  const applySetupResult = async (channel: ChannelChoice, result: ChannelSetupResult) => {
+  const applySetupResult = async (
+    channel: ChannelChoice,
+    result: ChannelSetupResult,
+    rollbackCfg?: OpenClawConfig,
+  ) => {
     const previousCfg = next;
-    next = result.cfg;
+    const setupApplied = result.setupApplied ?? result.cfg !== previousCfg;
+    next = !setupApplied && rollbackCfg ? rollbackCfg : result.cfg;
     const adapter = getVisibleSetupFlowAdapter(channel);
-    if (result.accountId) {
+    if (setupApplied && result.accountId) {
       recordAccount(channel, result.accountId);
       const postWriteHook = createChannelOnboardingPostWriteHook({
         accountId: result.accountId,
@@ -435,22 +454,25 @@ export async function setupChannels(
         options?.onPostWriteHook?.(postWriteHook);
       }
     }
-    addSelection(channel);
+    if (setupApplied) {
+      addSelection(channel);
+    }
     await refreshStatus(channel);
   };
 
   const applyCustomSetupResult = async (
     channel: ChannelChoice,
     result: ChannelSetupConfiguredResult,
+    rollbackCfg?: OpenClawConfig,
   ) => {
     if (result === "skip") {
       return false;
     }
-    await applySetupResult(channel, result);
+    await applySetupResult(channel, result, rollbackCfg);
     return true;
   };
 
-  const configureChannel = async (channel: ChannelChoice) => {
+  const configureChannel = async (channel: ChannelChoice, rollbackCfg = next) => {
     if (scopedPluginsById.has(channel)) {
       await loadScopedChannelPlugin(channel, undefined, {
         forceReload: true,
@@ -477,10 +499,11 @@ export async function setupChannels(
       shouldPromptAccountIds,
       forceAllowFrom: forceAllowFromChannels.has(channel),
     });
-    await applySetupResult(channel, result);
+    await applySetupResult(channel, result, rollbackCfg);
   };
 
   const handleConfiguredChannel = async (channel: ChannelChoice, label: string) => {
+    const rollbackCfg = next;
     const plugin = getVisibleChannelPlugin(channel);
     const adapter = getVisibleSetupFlowAdapter(channel);
     if (adapter?.configureWhenConfigured) {
@@ -495,7 +518,7 @@ export async function setupChannels(
         configured: true,
         label,
       });
-      if (!(await applyCustomSetupResult(channel, custom))) {
+      if (!(await applyCustomSetupResult(channel, custom, rollbackCfg))) {
         return;
       }
       return;
@@ -515,7 +538,7 @@ export async function setupChannels(
       return;
     }
     if (action === "update") {
-      await configureChannel(channel);
+      await configureChannel(channel, rollbackCfg);
       return;
     }
     if (!options?.allowDisable) {
@@ -578,6 +601,7 @@ export async function setupChannels(
   const handleChannelChoice = async (
     channel: ChannelChoice,
   ): Promise<"done" | "retry_selection"> => {
+    const rollbackCfg = next;
     const { catalogById, installedCatalogById } = getChannelEntries();
     const catalogEntry = catalogById.get(channel);
     const installedCatalogEntry = installedCatalogById.get(channel);
@@ -727,7 +751,7 @@ export async function setupChannels(
         configured,
         label,
       });
-      if (!(await applyCustomSetupResult(channel, custom))) {
+      if (!(await applyCustomSetupResult(channel, custom, rollbackCfg))) {
         return "done";
       }
       return "done";
@@ -736,7 +760,7 @@ export async function setupChannels(
       await handleConfiguredChannel(channel, label);
       return "done";
     }
-    await configureChannel(channel);
+    await configureChannel(channel, rollbackCfg);
     return "done";
   };
 

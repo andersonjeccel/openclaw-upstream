@@ -80,6 +80,7 @@
   "ssrf-runtime",
   "ssrf-runtime-internal",
   "media-runtime",
+  "qr-terminal-runtime",
   "media-store",
   "media-mime",
   "embedding-providers",

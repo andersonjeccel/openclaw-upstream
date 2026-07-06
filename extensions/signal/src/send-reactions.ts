@@ -79,11 +79,11 @@ async function sendReactionSignalCore(params: {
   errors: SignalReactionErrorMessages;
 }): Promise<SignalReactionResult> {
   const cfg = requireRuntimeConfig(params.opts.cfg, "Signal reactions");
-  const apiMode = cfg.channels?.signal?.apiMode;
   const accountInfo = resolveSignalAccount({
     cfg,
     accountId: params.opts.accountId,
   });
+  const apiMode = accountInfo.config.apiMode;
   const { baseUrl, account } = resolveSignalRpcContext(params.opts, accountInfo);
 
   const normalizedRecipient = normalizeSignalUuid(params.recipient);
