@@ -284,11 +284,40 @@ extension OpenClawChatViewModel {
             confirmedKeys.contains(Self.outboxUserIdempotencyKey(command.id))
         }
         for command in commands {
+            if let canonicalMessage = messages.first(where: {
+                Self.normalizedIdempotencyKey($0.idempotencyKey) ==
+                    Self.outboxUserIdempotencyKey(command.id)
+            }) {
+                await self.persistCanonicalOutboxEvidence(canonicalMessage, for: command)
+            }
             let result = await outbox.confirmCommand(id: command.id)
             if result != .unavailable {
                 self.clearOutboxState(forCommandID: command.id)
             }
         }
+    }
+
+    private func persistCanonicalOutboxEvidence(
+        _ message: OpenClawChatMessage,
+        for command: OpenClawChatOutboxCommand) async
+    {
+        guard let transcriptCache = transcriptCache as? any OpenClawChatCanonicalTranscriptMerging else { return }
+        let sessionKey = command.sessionKey
+        let cacheAgentID = Self.transcriptCacheAgentID(
+            sessionKey: sessionKey,
+            agentID: command.agentID)
+        let messageKey = Self.outboxUserIdempotencyKey(command.id)
+        let previous = self.pendingCacheWriteTask
+        let task = Task.detached {
+            await previous?.value
+            await transcriptCache.mergeCanonicalTranscriptMessage(
+                sessionKey: sessionKey,
+                agentID: cacheAgentID,
+                message: message,
+                canonicalMessageIdempotencyKey: messageKey)
+        }
+        self.pendingCacheWriteTask = task
+        await task.value
     }
 
     private func observeCanonicalOutboxMessageKeys(in messages: [OpenClawChatMessage]) {

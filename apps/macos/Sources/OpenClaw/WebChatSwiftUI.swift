@@ -350,11 +350,14 @@ final class WebChatSwiftUIWindowController {
         // so binding the cache identity at construction stays correct. One
         // store instance backs both the transcript cache and the offline
         // command outbox.
-        let store = MacChatTranscriptCache.make()
+        let context = MacChatTranscriptCache.makeContext()
+        let store = context?.store
         self.init(
             sessionKey: sessionKey,
             presentation: presentation,
             transport: MacGatewayChatTransport(outboxGatewayID: store?.gatewayID),
+            initialActiveAgentID: context?.routingIdentity?.defaultAgentID,
+            initialSessionRoutingContract: context?.routingIdentity?.contract,
             transcriptCache: store,
             outbox: store)
     }
@@ -363,6 +366,8 @@ final class WebChatSwiftUIWindowController {
         sessionKey: String,
         presentation: WebChatPresentation,
         transport: any OpenClawChatTransport,
+        initialActiveAgentID: String? = nil,
+        initialSessionRoutingContract: String? = nil,
         transcriptCache: (any OpenClawChatTranscriptCache)? = nil,
         outbox: (any OpenClawChatCommandOutbox)? = nil)
     {
@@ -371,6 +376,8 @@ final class WebChatSwiftUIWindowController {
         let vm = OpenClawChatViewModel(
             sessionKey: sessionKey,
             transport: transport,
+            activeAgentId: initialActiveAgentID,
+            sessionRoutingContract: initialSessionRoutingContract,
             transcriptCache: transcriptCache,
             outbox: outbox,
             initialThinkingLevel: Self.persistedThinkingLevel(),
@@ -390,6 +397,13 @@ final class WebChatSwiftUIWindowController {
                     nil
                 }
                 if let routingIdentity {
+                    if let store = transcriptCache as? OpenClawChatSQLiteTranscriptCache,
+                       store.gatewayID == MacChatTranscriptCache.currentGatewayID(),
+                       let persistedIdentity = OpenClawChatSessionRoutingIdentity(
+                           contract: routingIdentity.contract)
+                    {
+                        await store.storeSessionRoutingIdentity(persistedIdentity)
+                    }
                     vm.syncDeliveryIdentity(
                         activeAgentId: routingIdentity.defaultAgentID,
                         sessionRoutingContract: routingIdentity.contract)

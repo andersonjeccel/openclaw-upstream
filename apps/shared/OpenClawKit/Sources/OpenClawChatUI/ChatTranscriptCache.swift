@@ -147,6 +147,17 @@ extension OpenClawChatTranscriptCache {
     public func observeCanonicalMessageIdempotencyKeys(_: Set<String>) {}
 }
 
+/// Optional atomic merge seam for cache owners that also provide a durable
+/// outbox. Keeping this separate preserves source compatibility for read-only
+/// transcript-cache conformers.
+public protocol OpenClawChatCanonicalTranscriptMerging: OpenClawChatTranscriptCache {
+    func mergeCanonicalTranscriptMessage(
+        sessionKey: String,
+        agentID: String?,
+        message: OpenClawChatMessage,
+        canonicalMessageIdempotencyKey: String) async
+}
+
 /// One durable queued chat command (text only in v1). `id` is the client UUID
 /// that becomes the transport idempotency key on flush, so at-least-once
 /// delivery stays safe across retries and app restarts.
@@ -338,18 +349,26 @@ public struct OpenClawChatSessionRoutingIdentity: Equatable, Sendable {
     public let defaultAgentID: String
     public let contract: String
 
+    public init?(contract: String?) {
+        let normalized = contract?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let normalized, !normalized.isEmpty else { return nil }
+        let parts = normalized.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              parts.allSatisfy({ !$0.isEmpty })
+        else { return nil }
+        self.scope = String(parts[0])
+        self.mainSessionKey = String(parts[1])
+        self.defaultAgentID = String(parts[2])
+        self.contract = normalized
+    }
+
     public init?(scope: String?, mainSessionKey: String?, defaultAgentID: String?) {
         guard let contract = OpenClawChatSessionRoutingContract.make(
             scope: scope,
             mainKey: mainSessionKey,
             defaultAgentID: defaultAgentID)
         else { return nil }
-        let parts = contract.split(separator: "|", omittingEmptySubsequences: false)
-        guard parts.count == 3 else { return nil }
-        self.scope = String(parts[0])
-        self.mainSessionKey = String(parts[1])
-        self.defaultAgentID = String(parts[2])
-        self.contract = contract
+        self.init(contract: contract)
     }
 }
 
@@ -361,7 +380,10 @@ public struct OpenClawChatSessionRoutingIdentity: Equatable, Sendable {
 /// Transcript rows are disposable, but the command outbox is persistent user
 /// state. Schema upgrades migrate the shared database; unknown or corrupt
 /// existing schemas fail closed without deleting queued commands.
-public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, OpenClawChatCommandOutbox {
+public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
+    OpenClawChatCanonicalTranscriptMerging,
+    OpenClawChatCommandOutbox
+{
     /// Bounds keep the cache small: enough for a recently-used session picker
     /// and a full first screen of transcript, not a durable archive.
     public static let maxCachedSessions = 50
@@ -449,6 +471,40 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         self.gatewayID = gatewayID
     }
 
+    /// Startup-only synchronous read for UI owners that must seed routing
+    /// before constructing a view model. Runtime writes stay actor-isolated.
+    public nonisolated static func loadSessionRoutingIdentity(
+        databaseURL: URL,
+        gatewayID: String) -> OpenClawChatSessionRoutingIdentity?
+    {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db
+        else {
+            sqlite3_close_v2(db)
+            return nil
+        }
+        defer { sqlite3_close_v2(db) }
+        var statement: OpaquePointer?
+        let sql = """
+        SELECT scope, main_session_key, default_agent_id
+        FROM gateway_routing_identity WHERE gateway_id = ?1
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        guard sqlite3_bind_text(statement, 1, gatewayID, -1, transient) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_ROW,
+              let scope = sqlite3_column_text(statement, 0),
+              let mainSessionKey = sqlite3_column_text(statement, 1),
+              let defaultAgentID = sqlite3_column_text(statement, 2)
+        else { return nil }
+        return OpenClawChatSessionRoutingIdentity(
+            scope: String(cString: scope),
+            mainSessionKey: String(cString: mainSessionKey),
+            defaultAgentID: String(cString: defaultAgentID))
+    }
+
     /// Startup-only cleanup, before any cache actor can own an open handle.
     public static func removeDatabaseFiles(at databaseURL: URL) {
         let fm = FileManager.default
@@ -488,6 +544,14 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     public func loadTranscript(sessionKey: String, agentID: String?) async -> [OpenClawChatMessage] {
         guard !self.isRetired else { return [] }
         guard let db = await handle() else { return [] }
+        return self.readTranscript(db, sessionKey: sessionKey, agentID: agentID)
+    }
+
+    private func readTranscript(
+        _ db: OpaquePointer,
+        sessionKey: String,
+        agentID: String?) -> [OpenClawChatMessage]
+    {
         let normalizedAgentID = Self.normalizedAgentID(agentID)
         guard let payload = selectPayload(
             db,
@@ -612,6 +676,39 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         await self.writeTranscript(sessionKey: sessionKey, agentID: agentID, messages: messages)
     }
 
+    public func mergeCanonicalTranscriptMessage(
+        sessionKey: String,
+        agentID: String?,
+        message: OpenClawChatMessage,
+        canonicalMessageIdempotencyKey: String) async
+    {
+        self.observeCanonicalMessageIdempotencyKeys([canonicalMessageIdempotencyKey])
+        guard !self.isRetired, let db = await handle() else { return }
+
+        if var canceledKeys = canceledMessageKeysBySession[sessionKey] {
+            canceledKeys.removeAll(where: { $0 == canonicalMessageIdempotencyKey })
+            self.canceledMessageKeysBySession[sessionKey] = canceledKeys.isEmpty ? nil : canceledKeys
+        }
+
+        // Keep the read, merge, and write in one actor turn. macOS shares this
+        // cache across windows, so a caller-side read/modify/write can erase a
+        // newer snapshot written by another view model.
+        var cached = self.readTranscript(db, sessionKey: sessionKey, agentID: agentID)
+        if let index = cached.firstIndex(where: {
+            $0.idempotencyKey?.trimmingCharacters(in: .whitespacesAndNewlines) ==
+                canonicalMessageIdempotencyKey
+        }) {
+            cached[index] = message
+        } else if let timestamp = message.timestamp,
+                  let index = cached.firstIndex(where: { ($0.timestamp ?? .greatestFiniteMagnitude) > timestamp })
+        {
+            cached.insert(message, at: index)
+        } else {
+            cached.append(message)
+        }
+        self.writeTranscript(db, sessionKey: sessionKey, agentID: agentID, messages: cached)
+    }
+
     public nonisolated func observeCanonicalMessageIdempotencyKeys(_ keys: Set<String>) {
         self.canonicalMessageProofHub.observe(keys)
     }
@@ -623,6 +720,15 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     {
         guard !self.isRetired else { return }
         guard let db = await handle() else { return }
+        self.writeTranscript(db, sessionKey: sessionKey, agentID: agentID, messages: messages)
+    }
+
+    private func writeTranscript(
+        _ db: OpaquePointer,
+        sessionKey: String,
+        agentID: String?,
+        messages: [OpenClawChatMessage])
+    {
         let normalizedAgentID = Self.normalizedAgentID(agentID)
         let canceledKeys = self.canceledMessageKeysBySession[sessionKey] ?? []
         let bounded = Self.cacheableMessages(messages).filter { message in

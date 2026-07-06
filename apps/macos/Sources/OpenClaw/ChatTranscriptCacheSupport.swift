@@ -9,6 +9,11 @@ import OpenClawChatUI
 /// classes (the iOS store applies `completeUntilFirstUserAuthentication`);
 /// at-rest protection here is the per-user container permissions plus FileVault.
 enum MacChatTranscriptCache {
+    struct Context {
+        let store: OpenClawChatSQLiteTranscriptCache
+        let routingIdentity: OpenClawChatSessionRoutingIdentity?
+    }
+
     /// Every chat window for one gateway must share the same outbox actor.
     /// Otherwise a newly opened window can mistake another live window's
     /// claimed send for crash residue during its first recovery pass.
@@ -102,13 +107,25 @@ enum MacChatTranscriptCache {
 
     @MainActor
     static func make() -> OpenClawChatSQLiteTranscriptCache? {
+        self.makeContext()?.store
+    }
+
+    /// Loads the small process-stable routing fact before Chat constructs its
+    /// view model, so cache partitioning and offline sends never bootstrap
+    /// against a nil agent.
+    @MainActor
+    static func makeContext() -> Context? {
         guard let gatewayID = currentGatewayID() else { return nil }
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         else {
             return nil
         }
         let databaseURL = base.appendingPathComponent("OpenClaw/chat-cache.sqlite", isDirectory: false)
-        return self.store(databaseURL: databaseURL, gatewayID: gatewayID)
+        return Context(
+            store: self.store(databaseURL: databaseURL, gatewayID: gatewayID),
+            routingIdentity: OpenClawChatSQLiteTranscriptCache.loadSessionRoutingIdentity(
+                databaseURL: databaseURL,
+                gatewayID: gatewayID))
     }
 
     @MainActor

@@ -1672,14 +1672,22 @@ struct ChatViewModelOutboxTests {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
-        #expect(await store.enqueueCommand(outboxTestCommand(
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
             id: "c-alias",
+            sessionKey: "main",
+            deliverySessionKey: "agent:main:main",
+            routingContract: "per-sender|main|main",
+            agentID: "main",
             text: "canonical alias",
-            createdAt: Date().timeIntervalSince1970)))
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .queued,
+            retryCount: 0,
+            lastError: nil)))
         #expect(await store.claimNextCommand()?.id == "c-alias")
         #expect(await store.markCommandAwaitingConfirmation(id: "c-alias") == .updated)
         let transport = OutboxTestTransport(healthy: false)
-        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store, transcriptCache: store)
         await MainActor.run {
             vm.load()
             vm.switchSession(to: "other-session")
@@ -1704,6 +1712,9 @@ struct ChatViewModelOutboxTests {
         try await waitUntil("canonical alias confirms background command") {
             await store.loadCommands().isEmpty
         }
+        let cached = await store.loadTranscript(sessionKey: "main", agentID: "main")
+        #expect(cached.map(\.idempotencyKey) == ["c-alias:user"])
+        #expect(cached.map { $0.content.compactMap(\.text).joined() } == ["canonical alias"])
     }
 
     @Test func `full queue refuses enqueue and keeps the draft`() async throws {

@@ -87,6 +87,9 @@ struct ChatTranscriptCacheStoreTests {
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
 
         await store.storeSessionRoutingIdentity(identity)
+        #expect(OpenClawChatSQLiteTranscriptCache.loadSessionRoutingIdentity(
+            databaseURL: url,
+            gatewayID: "gw-a") == identity)
 
         let reopened = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
         #expect(await reopened.loadSessionRoutingIdentity() == identity)
@@ -783,6 +786,27 @@ struct ChatCommandOutboxStoreTests {
             canonicalMessageIdempotencyKeys: ["c-canonical-first:user"])
         #expect(await store.cancelCommand(id: "c-canonical-first") == .confirmed)
         #expect(await messageTexts(store.loadTranscript(sessionKey: "main")) == ["already landed"])
+    }
+
+    @Test func `canonical message merge preserves a newer cached snapshot`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        await store.storeTranscript(sessionKey: "main", messages: [
+            cacheMessage(role: "assistant", text: "newer row", timestamp: 2, idempotencyKey: "newer-run"),
+        ])
+
+        await store.mergeCanonicalTranscriptMessage(
+            sessionKey: "main",
+            agentID: nil,
+            message: cacheMessage(
+                role: "user",
+                text: "confirmed row",
+                timestamp: 1,
+                idempotencyKey: "confirmed:user"),
+            canonicalMessageIdempotencyKey: "confirmed:user")
+
+        #expect(await messageTexts(store.loadTranscript(sessionKey: "main")) == ["confirmed row", "newer row"])
     }
 
     @Test func `scoped cancellation scrubs the canonical transcript partition`() async throws {
