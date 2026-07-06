@@ -460,9 +460,10 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
     }
 
     func setSessionModel(sessionKey: String, model: String?) async throws {
+        let target = self.sessionTarget(for: sessionKey)
         let json = try Self.makeSessionPatchModelParamsJSON(
-            sessionKey: sessionKey,
-            agentId: self.selectedGlobalAgentId(for: sessionKey),
+            sessionKey: target.sessionKey,
+            agentId: target.agentID,
             model: model)
         _ = try await self.gateway.request(method: "sessions.patch", paramsJSON: json, timeoutSeconds: 15)
     }

@@ -339,7 +339,7 @@ final class NodeAppModel {
         }
         return IOSGatewayChatTransport(
             gateway: self.operatorSession,
-            globalAgentId: chatDeliveryAgentId,
+            globalAgentId: self.chatDeliveryAgentId,
             outboxGatewayID: outboxGatewayID)
     }
 
@@ -379,23 +379,23 @@ final class NodeAppModel {
     /// retire/purge can close every open handle). Nil for fixture/unpaired
     /// transports: no cache and no outbox.
     func makeChatOfflineStore() -> OpenClawChatSQLiteTranscriptCache? {
-        guard let gatewayID = chatTranscriptCacheGatewayID else { return nil }
-        if let cache = chatTranscriptCachesByGatewayID[gatewayID] {
+        guard let gatewayID = self.chatTranscriptCacheGatewayID else { return nil }
+        if let cache = self.chatTranscriptCachesByGatewayID[gatewayID] {
             return cache
         }
-        guard let databaseURL = chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return nil }
+        guard let databaseURL = self.chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return nil }
         let cache = OpenClawChatSQLiteTranscriptCache(databaseURL: databaseURL, gatewayID: gatewayID)
         self.chatTranscriptCachesByGatewayID[gatewayID] = cache
         return cache
     }
 
     func loadCachedChatSessions() async -> [OpenClawChatSessionEntry] {
-        guard let cache = makeChatOfflineStore() else { return [] }
+        guard let cache = self.makeChatOfflineStore() else { return [] }
         return await cache.loadSessions()
     }
 
     func storeCachedChatSessions(_ sessions: [OpenClawChatSessionEntry]) async {
-        guard let cache = makeChatOfflineStore() else { return }
+        guard let cache = self.makeChatOfflineStore() else { return }
         await cache.storeSessions(sessions)
     }
 
@@ -405,8 +405,8 @@ final class NodeAppModel {
     /// drops that gateway's queued commands.
     func purgeChatTranscriptCache(gatewayID: String? = nil) async {
         if let gatewayID, !gatewayID.isEmpty {
-            guard let databaseURL = chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return }
-            if let cache = chatTranscriptCachesByGatewayID[gatewayID] {
+            guard let databaseURL = self.chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return }
+            if let cache = self.chatTranscriptCachesByGatewayID[gatewayID] {
                 await cache.retire()
             }
             OpenClawChatSQLiteTranscriptCache.removeDatabaseFiles(at: databaseURL)
@@ -420,7 +420,7 @@ final class NodeAppModel {
         for cache in self.chatTranscriptCachesByGatewayID.values {
             await cache.retire()
         }
-        if let directoryURL = chatTranscriptCacheDirectoryURL() {
+        if let directoryURL = self.chatTranscriptCacheDirectoryURL() {
             try? FileManager.default.removeItem(at: directoryURL)
         }
         self.chatTranscriptCachesByGatewayID.removeAll()
@@ -430,7 +430,7 @@ final class NodeAppModel {
     /// Debug launch reset runs before Chat can create a cache actor, so direct
     /// file removal preserves the launch flag's synchronous startup contract.
     func purgeChatTranscriptCacheBeforeStartup() {
-        guard let directoryURL = chatTranscriptCacheDirectoryURL() else { return }
+        guard let directoryURL = self.chatTranscriptCacheDirectoryURL() else { return }
         try? FileManager.default.removeItem(at: directoryURL)
         self.chatTranscriptCachesByGatewayID.removeAll()
         self.chatTranscriptCacheGeneration &+= 1
@@ -2364,9 +2364,9 @@ extension NodeAppModel {
         if let sessionAgentId = SessionKey.agentId(from: chatSessionKey) {
             return sessionAgentId.lowercased()
         }
-        let selected = (selectedAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let selected = (self.selectedAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !selected.isEmpty { return selected.lowercased() }
-        let defaultId = (gatewayDefaultAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultId = (self.gatewayDefaultAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return defaultId.isEmpty ? nil : defaultId.lowercased()
     }
 
@@ -3919,10 +3919,10 @@ extension NodeAppModel {
         }
 
         let routeGeneration = self.gatewayRouteGeneration
-        guard let gatewayStableID = connectedGatewayID,
-              let nodeRoute = await nodeGateway.currentRoute(),
+        guard let gatewayStableID = self.connectedGatewayID,
+              let nodeRoute = await self.nodeGateway.currentRoute(),
               shouldContinue(),
-              isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
+              self.isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
         else { return }
 
         do {
@@ -4023,7 +4023,7 @@ extension NodeAppModel {
         presentIn actions: [PendingForegroundNodeAction],
         gatewayStableID: String)
     {
-        guard let completed = completedPendingForegroundActionIDsByGateway[gatewayStableID] else {
+        guard let completed = self.completedPendingForegroundActionIDsByGateway[gatewayStableID] else {
             return
         }
         let retained = completed.intersection(actions.map(\.id))
@@ -4071,8 +4071,8 @@ extension NodeAppModel {
             let expectedRoute: GatewayNodeSessionRoute?
             if let routeContext {
                 guard self.activeGatewayConnectConfig?.effectiveStableID == routeContext.gatewayStableID,
-                      let currentRoute = await nodeGateway.currentRoute(),
-                      activeGatewayConnectConfig?.effectiveStableID == routeContext.gatewayStableID
+                      let currentRoute = await self.nodeGateway.currentRoute(),
+                      self.activeGatewayConnectConfig?.effectiveStableID == routeContext.gatewayStableID
                 else { return false }
                 expectedRoute = currentRoute
             } else {
@@ -5441,7 +5441,7 @@ extension NodeAppModel {
     func handleExecApprovalResolvedRemotePush(_ push: ExecApprovalNotificationPrompt) async -> Bool {
         switch await self.validateExecApprovalPushRoute(push, sourceReason: "push_resolved") {
         case let .validated(context):
-            let applied = await applyValidatedExecApprovalResolvedPush(push, context: context)
+            let applied = await self.applyValidatedExecApprovalResolvedPush(push, context: context)
             if !applied {
                 self.appendPendingExecApprovalResolvedPush(push)
             }
@@ -6010,7 +6010,7 @@ extension NodeAppModel {
         }
         guard let route,
               shouldContinue(),
-              isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
+              self.isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
         else {
             return nil
         }
