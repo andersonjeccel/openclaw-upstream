@@ -277,7 +277,8 @@ actor GatewayConnection {
         method: String,
         params: [String: AnyCodable]?,
         timeoutMs: Double? = nil,
-        ifCurrentRoute route: Route) async throws -> Data
+        ifCurrentRoute route: Route,
+        distinguishPreDispatchRouteChange: Bool = false) async throws -> Data
     {
         let cfg = try await configProvider()
         guard route.generation == self.routeGeneration,
@@ -287,6 +288,9 @@ actor GatewayConnection {
               self.configuredPassword == route.password,
               let client
         else {
+            if distinguishPreDispatchRouteChange {
+                throw OpenClawChatTransportSendError.notDispatched
+            }
             throw CancellationError()
         }
         return try await client.request(method: method, params: params, timeoutMs: timeoutMs)
@@ -776,7 +780,8 @@ extension GatewayConnection {
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload],
         timeoutMs: Int = 30000,
-        ifCurrentRoute route: Route? = nil) async throws -> OpenClawChatSendResponse
+        ifCurrentRoute route: Route? = nil,
+        distinguishPreDispatchRouteChange: Bool = false) async throws -> OpenClawChatSendResponse
     {
         let resolvedKey = self.canonicalizeSessionKey(sessionKey)
         var params: [String: AnyCodable] = [
@@ -817,7 +822,8 @@ extension GatewayConnection {
                 method: Method.chatSend.rawValue,
                 params: params,
                 timeoutMs: Double(timeoutMs),
-                ifCurrentRoute: route)
+                ifCurrentRoute: route,
+                distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange)
             return try self.decoder.decode(OpenClawChatSendResponse.self, from: data)
         }
         return try await self.requestDecoded(method: .chatSend, params: params, timeoutMs: Double(timeoutMs))

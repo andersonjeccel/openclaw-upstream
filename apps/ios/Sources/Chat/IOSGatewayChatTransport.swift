@@ -167,7 +167,8 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
                     thinking: thinking,
                     idempotencyKey: idempotencyKey,
                     attachments: attachments,
-                    ifCurrentRoute: route)
+                    ifCurrentRoute: route,
+                    distinguishPreDispatchRouteChange: true)
             },
             requestTargetedHistory: { sessionKey, agentID in
                 try await transport.requestHistory(
@@ -596,7 +597,7 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         let normalizedContract = expectedSessionRoutingContract?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let normalizedContract, !normalizedContract.isEmpty else {
-            throw CancellationError()
+            throw OpenClawChatTransportSendError.notDispatched
         }
         let route: GatewayNodeSessionRoute? = if let outboxGatewayID {
             await self.gateway.currentRoute(ifGatewayID: outboxGatewayID)
@@ -607,23 +608,22 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
               let supportsRoutingContract = await gateway.supportsServerCapability(
                   .chatSendRoutingContract,
                   ifCurrentRoute: route)
-        else { throw CancellationError() }
-        guard supportsRoutingContract else {
-            throw GatewayResponseError(
-                method: "chat.send",
-                code: "INVALID_REQUEST",
-                message: OpenClawChatTransportUpgradeMessage.routingContract,
-                details: nil)
-        }
+        else { throw OpenClawChatTransportSendError.notDispatched }
+        // Durable replay requires the atomic server guard and is blocked in
+        // acquireOutboxRouteLease. Keep ordinary live chat compatible with
+        // older gateways by retaining the captured route but omitting the
+        // unsupported request field.
+        let guardedContract = supportsRoutingContract ? normalizedContract : nil
         return try await self.sendMessage(
             sessionKey: sessionKey,
             agentID: agentID,
-            expectedSessionRoutingContract: normalizedContract,
+            expectedSessionRoutingContract: guardedContract,
             message: message,
             thinking: thinking,
             idempotencyKey: idempotencyKey,
             attachments: attachments,
-            ifCurrentRoute: route)
+            ifCurrentRoute: route,
+            distinguishPreDispatchRouteChange: true)
     }
 
     func sendMessage(
@@ -634,7 +634,8 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         thinking: String,
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload],
-        ifCurrentRoute expectedRoute: GatewayNodeSessionRoute?) async throws -> OpenClawChatSendResponse
+        ifCurrentRoute expectedRoute: GatewayNodeSessionRoute?,
+        distinguishPreDispatchRouteChange: Bool = false) async throws -> OpenClawChatSendResponse
     {
         let target = self.sessionTarget(for: sessionKey, overrideAgentID: agentID)
         let startLogMessage =
@@ -656,11 +657,16 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
                 method: "chat.send",
                 paramsJSON: json,
                 timeoutSeconds: 35,
-                ifCurrentRoute: expectedRoute)
+                ifCurrentRoute: expectedRoute,
+                distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange)
             let decoded = try JSONDecoder().decode(OpenClawChatSendResponse.self, from: res)
             Self.logger.info("chat.send ok runId=\(decoded.runId, privacy: .public)")
             GatewayDiagnostics.log("chat.send ok runId=\(decoded.runId) status=\(decoded.status)")
             return decoded
+        } catch is GatewayNodeSessionRequestError {
+            Self.logger.info("chat.send skipped because the captured route changed before dispatch")
+            GatewayDiagnostics.log("chat.send skipped before dispatch: route changed")
+            throw OpenClawChatTransportSendError.notDispatched
         } catch {
             Self.logger.error("chat.send failed \(error.localizedDescription, privacy: .public)")
             GatewayDiagnostics.log("chat.send failed error=\(error.localizedDescription)")

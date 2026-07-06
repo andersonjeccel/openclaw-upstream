@@ -42,6 +42,7 @@ private actor OutboxTransportState {
     var healthy: Bool
     var routeGeneration = 0
     var sendFails: Bool
+    var sendFailsAfterRecording = false
     var sendRejects = false
     var sendResponseErrors = false
     var sendRoutingChanged = false
@@ -110,6 +111,10 @@ private actor OutboxTransportState {
 
     func setSendFails(_ fails: Bool) {
         self.sendFails = fails
+    }
+
+    func setSendFailsAfterRecording(_ fails: Bool) {
+        self.sendFailsAfterRecording = fails
     }
 
     func setSendRejects(_ rejects: Bool) {
@@ -260,7 +265,7 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
         expectedRoute: Int?) async throws -> OpenClawChatSendResponse
     {
         if let expectedRoute, await state.routeGeneration != expectedRoute {
-            throw CancellationError()
+            throw OpenClawChatTransportSendError.notDispatched
         }
         if let gate = await state.heldSendGate {
             // One-shot: only the first send is held so tests can pin the
@@ -269,7 +274,7 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
             await gate.wait()
         }
         if let expectedRoute, await state.routeGeneration != expectedRoute {
-            throw CancellationError()
+            throw OpenClawChatTransportSendError.notDispatched
         }
         if await self.state.sendFails {
             throw OutboxSendError()
@@ -300,6 +305,9 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
             message: message,
             idempotencyKey: idempotencyKey,
             thinking: thinking)
+        if await self.state.sendFailsAfterRecording {
+            throw OutboxSendError()
+        }
         return OpenClawChatSendResponse(runId: idempotencyKey, status: "accepted")
     }
 
@@ -1474,13 +1482,13 @@ struct ChatViewModelOutboxTests {
         #expect(await store.loadCommands().isEmpty)
     }
 
-    @Test func `transport failures keep commands queued without burning attempts`() async throws {
+    @Test func `ambiguous live transport failure requires explicit retry`() async throws {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
         // Health reads true, but the actual send path is down: the send gate
-        // is bypassed and the transport error must requeue instead of losing
-        // the draft.
+        // is bypassed and the transport error must preserve instead of losing
+        // the optimistic turn.
         let transport = OutboxTestTransport(healthy: true, sendFails: true)
         let vm = await makeOutboxViewModel(transport: transport, outbox: store)
 
@@ -1493,40 +1501,61 @@ struct ChatViewModelOutboxTests {
             vm.send()
         }
 
-        // The optimistic bubble survives as a durable outbox row that stays
-        // queued: connectivity blips never burn retry attempts.
-        try await waitUntil("send requeued durably") {
-            await store.loadCommands().map(\.status) == [.queued]
+        // The optimistic bubble survives, but delivery is ambiguous. It must
+        // not return to the automatic queue after dedupe expiry or restart.
+        try await waitUntil("ambiguous send preserved durably") {
+            await store.loadCommands().map(\.status) == [.failed]
         }
-        // Give the automatic retry chain a few cycles to prove the row never
-        // escalates toward failed while the transport keeps throwing. The
-        // status may read 'sending' mid-attempt; the invariants are that it
-        // never turns failed and attempts stay unburned.
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let requeued = try #require(await store.loadCommands().first)
-        #expect(requeued.status != .failed)
-        #expect(requeued.retryCount == 0)
-        #expect(requeued.text == "stale health send")
+        let preserved = try #require(await store.loadCommands().first)
+        #expect(preserved.lastError == OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError)
+        #expect(preserved.retryCount == 0)
+        #expect(preserved.text == "stale health send")
         #expect(await userTexts(vm) == ["stale health send"])
         let bubbleKey = await MainActor.run {
             vm.messages.first { $0.role == "user" }?.idempotencyKey
         }
-        // Same idempotency identity as the failed live send, so a duplicate
-        // delivery on the gateway side stays deduped.
-        #expect(bubbleKey == "\(requeued.id):user")
+        #expect(bubbleKey == "\(preserved.id):user")
+        #expect(await MainActor.run {
+            vm.messages.contains { vm.outboxState(for: $0.id)?.isFailed == true }
+        })
+        #expect(await MainActor.run { !vm.healthOK })
 
-        // Once the transport recovers, the next healthy transition drains
-        // the row without any user action. (Repeated throws exhaust the
-        // retry ladder and drop health, so recovery is signaled the same way
-        // a real reconnect is.)
+        // Connectivity recovery only reconciles history; it cannot replay an
+        // unproven send. A user retry creates the new delivery intent.
         await transport.state.setSendFails(false)
         await transport.goOnline()
-        // Generous timeout: draining rides the millisecond retry chain, which
-        // can be starved under full parallel suite load.
-        try await waitUntil("requeued command drained", timeoutSeconds: 10) {
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(await store.loadCommands().map(\.status) == [.failed])
+        #expect(await transport.state.sentIdempotencyKeys.isEmpty)
+
+        let messageID = try #require(await MainActor.run { vm.messages.last?.id })
+        await MainActor.run { vm.retryOutboxMessage(messageID) }
+        try await waitUntil("explicit retry drained", timeoutSeconds: 10) {
             await store.loadCommands().isEmpty
         }
-        #expect(await transport.state.sentIdempotencyKeys == [requeued.id])
+        #expect(await transport.state.sentIdempotencyKeys == [preserved.id])
+    }
+
+    @Test func `lost queued send ack reconciles history without replay`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "accepted before disconnect")
+        await transport.state.setSendFailsAfterRecording(true)
+        await transport.goOnline()
+
+        try await waitUntil("gateway accepted before ack loss") {
+            await transport.state.sentIdempotencyKeys.count == 1
+        }
+        try await waitUntil("canonical history retires ambiguous send") {
+            await store.loadCommands().isEmpty
+        }
+        #expect(await transport.state.sentMessages == ["accepted before disconnect"])
+        #expect(await transport.state.sentIdempotencyKeys.count == 1)
     }
 
     @Test func `tap retry refreshes createdAt so an expired command can resend`() async throws {
@@ -1710,7 +1739,7 @@ struct ChatViewModelOutboxTests {
         #expect(await store.loadCommands().count == OpenClawChatSQLiteTranscriptCache.maxQueuedCommands)
     }
 
-    @Test func `repeated transport failures climb the backoff ladder then drop health`() async throws {
+    @Test func `queued send transport failure fails closed until explicit retry`() async throws {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
@@ -1720,32 +1749,31 @@ struct ChatViewModelOutboxTests {
         await MainActor.run { vm.load() }
         try await sendWhileOffline(vm, text: "stuck in transit")
 
-        // Gateway reports healthy but every send throws: the flush must walk
-        // the retry ladder (streak 1, 2) and then drop health instead of
-        // retrying at the first rung forever.
+        // Gateway reports healthy but the send throws. One ambiguous attempt
+        // must fail closed and drop health without automatic replay.
         await transport.goOnline()
-        // healthOK starts false pre-goOnline, so the exhaustion signal is
-        // the streak walking past the ladder (2 rungs in tests) WITH health
-        // down again — not the initial offline state.
-        try await waitUntil("ladder exhausted and health dropped") {
-            await MainActor.run { vm.outboxTransportFailureStreak >= 3 && !vm.healthOK }
+        try await waitUntil("ambiguous queued send fails closed") {
+            let failed = await store.loadCommands().first?.status == .failed
+            let healthDown = await MainActor.run { !vm.healthOK }
+            return failed && healthDown
         }
-        // Row survives as queued: transport throws never burn durable
-        // attempts.
-        let commands = await store.loadCommands()
-        #expect(commands.map(\.status) == [.queued])
-        #expect(commands.map(\.retryCount) == [0])
+        let command = try #require(await store.loadCommands().first)
+        #expect(command.lastError == OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError)
+        #expect(command.retryCount == 0)
+        #expect(await transport.state.sentIdempotencyKeys.isEmpty)
 
-        // A genuine recovery flushes normally and resets the streak.
+        // Reconnect only reconciles. Explicit retry is required to send.
         await transport.state.setSendFails(false)
         await transport.goOnline()
-        try await waitUntil("command sent after recovery") {
-            await transport.state.sentIdempotencyKeys.count == 1
-        }
-        try await waitUntil("row drained") {
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(await store.loadCommands().map(\.status) == [.failed])
+
+        let messageID = try #require(await MainActor.run { vm.messages.last?.id })
+        await MainActor.run { vm.retryOutboxMessage(messageID) }
+        try await waitUntil("explicit retry drains command") {
             await store.loadCommands().isEmpty
         }
-        #expect(await MainActor.run { vm.outboxTransportFailureStreak } == 0)
+        #expect(await transport.state.sentIdempotencyKeys == [command.id])
     }
 
     @Test func `deleting a queued message removes bubble and durable row`() async throws {
@@ -2232,10 +2260,11 @@ extension ChatViewModelOutboxTests {
 
         await transport.state.replaceRoute()
         await sendGate.open()
-        try await waitUntil("route cancellation requeues command") {
+        try await waitUntil("pre-dispatch route cancellation requeues command") {
             await store.loadCommands().map(\.status) == [.queued]
         }
         #expect(await transport.state.sentMessages.isEmpty)
+        #expect(await store.loadCommands().first?.lastError == nil)
         #expect(await MainActor.run { !vm.healthOK })
     }
 }

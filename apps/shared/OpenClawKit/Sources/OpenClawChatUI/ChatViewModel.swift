@@ -98,12 +98,6 @@ public final class OpenClawChatViewModel {
     /// Backoff between failed flush attempts; internal so tests can shorten it.
     @ObservationIgnored
     var outboxRetryDelaysMs: [UInt64] = [2000, 8000]
-    /// Consecutive transport-level flush failures. Paces retries up the
-    /// delay ladder without touching the durable per-command retryCount
-    /// (reserved for gateway verdicts); past the ladder, health drops and
-    /// the reconnect machinery owns pacing.
-    @ObservationIgnored
-    var outboxTransportFailureStreak = 0
     /// False until restoreOutboxMessages has adopted durable rows for the
     /// visible session. Until then the in-memory outbox state is blind to
     /// rows persisted by an earlier process, so the FIFO send gate must
@@ -1339,26 +1333,29 @@ public final class OpenClawChatViewModel {
         } catch {
             guard self.isCurrentSession(sessionSnapshot) else { return }
             // Stale-healthy disconnects surface here instead of at the send
-            // gate. Requeue text-only sends durably (same runId = same
-            // idempotency identity, safe even if the send actually landed)
-            // and keep the optimistic bubble as the queued row.
+            // gate. A route rejection before dispatch stays auto-retryable;
+            // every ambiguous failure remains fail-closed.
             if encodedAttachments.isEmpty, !(error is GatewayResponseError) {
                 self.runMessageScopesByRunID.removeValue(forKey: runId)
                 self.clearPendingRun(runId)
-                let requeued = await requeueFailedLiveSend(
+                let deliveryIsAmbiguous = !(error is OpenClawChatTransportSendError)
+                let preserved = await preserveFailedLiveSend(
                     runId: runId,
                     text: messageText,
                     thinking: thinkingLevel,
                     messageID: userMessageID,
-                    session: sessionSnapshot)
-                if requeued {
+                    session: sessionSnapshot,
+                    deliveryIsAmbiguous: deliveryIsAmbiguous)
+                if preserved {
+                    self.applyTransportHealth(false)
+                    let outcome = deliveryIsAmbiguous ? "delivery unconfirmed" : "queued after route change"
                     self.logDiagnostic(
-                        "chat.ui send requeued offline sessionKey=\(sessionKey) "
+                        "chat.ui send \(outcome) sessionKey=\(sessionKey) "
                             + "localRunId=\(runId) error=\(error.localizedDescription)")
                     return
                 }
                 guard self.isCurrentSession(sessionSnapshot) else { return }
-                // Refused requeue (queue full / broken store): restore the
+                // Refused persistence (queue full / broken store): restore the
                 // draft so the text is not lost with the failed bubble.
                 if self.input.isEmpty {
                     self.input = messageText

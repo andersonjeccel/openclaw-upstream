@@ -141,7 +141,7 @@ struct MacGatewayChatTransport: OpenClawChatTransport {
         let normalizedContract = expectedSessionRoutingContract?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let normalizedContract, !normalizedContract.isEmpty else {
-            throw CancellationError()
+            throw OpenClawChatTransportSendError.notDispatched
         }
         if let outboxGatewayID {
             try await Self.requireGateway(outboxGatewayID)
@@ -150,23 +150,21 @@ struct MacGatewayChatTransport: OpenClawChatTransport {
               let supportsRoutingContract = await GatewayConnection.shared.supportsServerCapability(
                   .chatSendRoutingContract,
                   ifCurrentRoute: route)
-        else { throw CancellationError() }
-        guard supportsRoutingContract else {
-            throw GatewayResponseError(
-                method: "chat.send",
-                code: "INVALID_REQUEST",
-                message: OpenClawChatTransportUpgradeMessage.routingContract,
-                details: nil)
-        }
+        else { throw OpenClawChatTransportSendError.notDispatched }
+        // Outbox replay is capability-gated in acquireOutboxRouteLease. A
+        // live send keeps its captured route on older gateways and omits the
+        // unsupported atomic routing field.
+        let guardedContract = supportsRoutingContract ? normalizedContract : nil
         return try await GatewayConnection.shared.chatSend(
             sessionKey: sessionKey,
             agentID: agentID,
-            expectedSessionRoutingContract: normalizedContract,
+            expectedSessionRoutingContract: guardedContract,
             message: message,
             thinking: thinking,
             idempotencyKey: idempotencyKey,
             attachments: attachments,
-            ifCurrentRoute: route)
+            ifCurrentRoute: route,
+            distinguishPreDispatchRouteChange: true)
     }
 
     func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLeaseResult {
@@ -197,7 +195,8 @@ struct MacGatewayChatTransport: OpenClawChatTransport {
                     thinking: thinking,
                     idempotencyKey: idempotencyKey,
                     attachments: attachments,
-                    ifCurrentRoute: route)
+                    ifCurrentRoute: route,
+                    distinguishPreDispatchRouteChange: true)
             },
             requestTargetedHistory: { sessionKey, agentID in
                 try await Self.requireGateway(outboxGatewayID)
@@ -211,7 +210,9 @@ struct MacGatewayChatTransport: OpenClawChatTransport {
 
     private static func requireGateway(_ gatewayID: String) async throws {
         let currentGatewayID = await MainActor.run { MacChatTranscriptCache.currentGatewayID() }
-        guard currentGatewayID == gatewayID else { throw CancellationError() }
+        guard currentGatewayID == gatewayID else {
+            throw OpenClawChatTransportSendError.notDispatched
+        }
     }
 
     func requestHealth(timeoutMs: Int) async throws -> Bool {

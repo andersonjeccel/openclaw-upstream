@@ -509,6 +509,16 @@ struct GatewayNodeSessionTests {
         } catch is CancellationError {
             // Expected: the route lease belongs to the first channel.
         }
+        do {
+            _ = try await gateway.request(
+                method: "exec.approval.get",
+                paramsJSON: "{}",
+                ifCurrentRoute: firstRoute,
+                distinguishPreDispatchRouteChange: true)
+            Issue.record("typed stale route request unexpectedly reached the replacement channel")
+        } catch is GatewayNodeSessionRequestError {
+            // Expected: callers can distinguish a request rejected before dispatch.
+        }
         let replacementTask = try #require(session.latestTask())
         #expect(replacementTask.sentRequestCount(method: "node.event") == 0)
         #expect(replacementTask.sentRequestCount(method: "exec.approval.get") == 0)

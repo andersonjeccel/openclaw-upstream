@@ -623,7 +623,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             INSERT INTO outbox_commands(
                 client_uuid, gateway_id, session_key, delivery_session_key, routing_contract,
                 agent_id, text, thinking, created_at, status, retry_count, last_error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '')
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             """,
             bindings: [
                 command.id,
@@ -637,6 +637,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
                 command.createdAt,
                 command.status.rawValue,
                 command.retryCount,
+                command.lastError ?? "",
             ])
     }
 

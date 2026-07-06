@@ -1,4 +1,5 @@
 import Foundation
+import OpenClawChatUI
 import OpenClawKit
 import os
 import Testing
@@ -96,6 +97,15 @@ struct GatewayConnectionTests {
                 ifCurrentRoute: route)
             Issue.record("expected stale route cancellation")
         } catch is CancellationError {}
+
+        do {
+            _ = try await conn.request(
+                method: "status",
+                params: nil,
+                ifCurrentRoute: route,
+                distinguishPreDispatchRouteChange: true)
+            Issue.record("expected typed stale route rejection")
+        } catch is OpenClawChatTransportSendError {}
 
         #expect(session.snapshotMakeCount() == 1)
         #expect(session.snapshotCancelCount() == 0)

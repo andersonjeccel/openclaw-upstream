@@ -48,6 +48,12 @@ public struct GatewayNodeSessionRoute: Sendable, Equatable {
     fileprivate let channelGeneration: UInt64
 }
 
+/// A route lease became stale before its request touched the channel. Unlike
+/// a socket cancellation, this proves the payload was never dispatched.
+public enum GatewayNodeSessionRequestError: Error, Sendable {
+    case routeChangedBeforeDispatch
+}
+
 public actor GatewayNodeSession {
     private let logger = Logger(subsystem: "ai.openclaw", category: "node.gateway")
     private let decoder = JSONDecoder()
@@ -397,9 +403,13 @@ public actor GatewayNodeSession {
         method: String,
         paramsJSON: String?,
         timeoutSeconds: Int = 15,
-        ifCurrentRoute expectedRoute: GatewayNodeSessionRoute? = nil) async throws -> Data
+        ifCurrentRoute expectedRoute: GatewayNodeSessionRoute? = nil,
+        distinguishPreDispatchRouteChange: Bool = false) async throws -> Data
     {
         if let expectedRoute, expectedRoute.channelGeneration != self.channelGeneration {
+            if distinguishPreDispatchRouteChange {
+                throw GatewayNodeSessionRequestError.routeChangedBeforeDispatch
+            }
             throw CancellationError()
         }
         guard let channel else {

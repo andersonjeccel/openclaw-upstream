@@ -178,17 +178,17 @@ extension OpenClawChatViewModel {
         }
     }
 
-    /// Requeue path for a live text send that failed at the transport while
-    /// `healthOK` was stale-true. Reuses the send's runId as the command ID so
-    /// the optimistic bubble's "\(runId):user" key and the gateway's dedupe
-    /// identity are preserved even if the failed send actually landed.
+    /// Durable path for a failed live text send. Known pre-dispatch route
+    /// changes remain queued; ambiguous results fail closed until canonical
+    /// history or explicit retry resolves them.
     /// Returns false when the queue refuses (caller keeps the failure path).
-    func requeueFailedLiveSend(
+    func preserveFailedLiveSend(
         runId: String,
         text: String,
         thinking: String,
         messageID: UUID,
-        session: SessionSnapshot) async -> Bool
+        session: SessionSnapshot,
+        deliveryIsAmbiguous: Bool) async -> Bool
     {
         guard let outbox else { return false }
         let agentID = self.outboxAgentID(for: session)
@@ -205,15 +205,17 @@ extension OpenClawChatViewModel {
             text: text,
             thinking: thinking,
             createdAt: Date().timeIntervalSince1970,
-            status: .queued,
+            status: deliveryIsAmbiguous ? .failed : .queued,
             retryCount: 0,
-            lastError: nil)
+            lastError: deliveryIsAmbiguous
+                ? OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError
+                : nil)
         guard await outbox.enqueueCommand(command) else { return false }
         guard self.isCurrentSession(session) else { return true }
         self.mapOutboxCommand(command, to: messageID)
         self.errorText = nil
-        // Auto-retry immediately while health still reads healthy; either the
-        // transport recovered or the command lands visibly in 'failed'.
+        // Ambiguous rows only reconcile history; known-unsent rows may flush
+        // automatically once the replacement route becomes healthy.
         self.flushOutboxIfNeeded()
         return true
     }
@@ -262,7 +264,7 @@ extension OpenClawChatViewModel {
     }
 
     /// Canonical history is the durable acceptance boundary. Any matching
-    /// outbox row—including a lost-ACK queued row—is now safe to remove
+    /// outbox row—including a delivery-unconfirmed row—is now safe to remove
     /// without replaying the user turn.
     func confirmOutboxCommands(in messages: [OpenClawChatMessage]) {
         self.observeCanonicalOutboxMessageKeys(in: messages)
@@ -433,13 +435,8 @@ extension OpenClawChatViewModel {
             }
             confirmationTargets.formUnion(
                 commands.lazy
-                    .filter { $0.status == .awaitingConfirmation }
-                    .map {
-                        OutboxDeliveryTarget(
-                            presentationSessionKey: $0.sessionKey,
-                            deliverySessionKey: $0.deliverySessionKey,
-                            agentID: $0.agentID)
-                    })
+                    .filter(Self.needsOutboxDeliveryReconciliation)
+                    .map(Self.deliveryTarget))
             let visibleSession = self.currentSessionSnapshot()
             self.presentOutboxCommands(commands.filter { self.commandMatchesTarget($0, session: visibleSession) })
             guard let next = await outbox.claimNextCommand() else { break }
@@ -497,21 +494,24 @@ extension OpenClawChatViewModel {
                     // confirmation already removed the row.
                     self.clearOutboxState(forCommandID: next.id)
                 }
-                self.outboxTransportFailureStreak = 0
-                confirmationTargets.insert(
-                    OutboxDeliveryTarget(
-                        presentationSessionKey: next.sessionKey,
-                        deliverySessionKey: next.deliverySessionKey,
-                        agentID: next.agentID))
-            } catch is CancellationError {
-                // The leased gateway route changed while the request was
-                // suspended. Never reacquire inside this pass: doing so could
-                // retarget this gateway-scoped row to the replacement route.
+                confirmationTargets.insert(Self.deliveryTarget(for: next))
+            } catch is OpenClawChatTransportSendError {
+                // The transport proved this payload never reached its request
+                // channel, so it is safe to retry automatically.
                 await outbox.markCommandQueued(
                     id: next.id,
                     retryCount: next.retryCount,
                     lastError: nil)
                 self.setOutboxState(.queued, forCommandID: next.id)
+                self.applyTransportHealth(false)
+                break
+            } catch is CancellationError {
+                // Cancellation while the request is suspended does not prove
+                // that the gateway rejected it. Never replay automatically.
+                let update = await self.parkOutboxCommandWithUnconfirmedDelivery(next, outbox: outbox)
+                if update == .updated {
+                    confirmationTargets.insert(Self.deliveryTarget(for: next))
+                }
                 self.applyTransportHealth(false)
                 break
             } catch let error as GatewayResponseError {
@@ -528,29 +528,15 @@ extension OpenClawChatViewModel {
                     reason: error.localizedDescription)
                 if handled { continue } else { break }
             } catch {
-                // Transport-level failure (unreachable, socket drop): a
-                // connectivity blip, not a gateway verdict on the command.
-                // Keep the row queued without burning a durable retry
-                // attempt; the in-memory streak paces repeated throws up the
-                // delay ladder instead of hammering the first rung forever.
+                // A socket error or timeout is not a gateway rejection: the
+                // request may have landed before its ACK was lost. Preserve
+                // it for history reconciliation or explicit user retry.
                 outboxLogger.error("outbox flush send failed \(error.localizedDescription, privacy: .public)")
-                await outbox.markCommandQueued(
-                    id: next.id,
-                    retryCount: next.retryCount,
-                    lastError: error.localizedDescription)
-                self.setOutboxState(.queued, forCommandID: next.id)
-                self.outboxTransportFailureStreak += 1
-                if self.outboxTransportFailureStreak > self.outboxRetryDelaysMs.count {
-                    // Ladder exhausted: the transport is not actually usable
-                    // despite healthOK. Drop health so the reconnect/poll
-                    // machinery owns pacing; the next genuine healthy
-                    // transition re-flushes and the row stays queued.
-                    self.healthOK = false
-                    break
+                let update = await self.parkOutboxCommandWithUnconfirmedDelivery(next, outbox: outbox)
+                if update == .updated {
+                    confirmationTargets.insert(Self.deliveryTarget(for: next))
                 }
-                // Strict createdAt ordering: never skip ahead of a command
-                // that is still deliverable.
-                self.scheduleOutboxRetry(afterAttempts: self.outboxTransportFailureStreak)
+                self.applyTransportHealth(false)
                 break
             }
         }
@@ -559,6 +545,40 @@ extension OpenClawChatViewModel {
                 targets: confirmationTargets,
                 routeLease: routeLease)
         }
+    }
+
+    private static func needsOutboxDeliveryReconciliation(_ command: OpenClawChatOutboxCommand) -> Bool {
+        command.status == .awaitingConfirmation ||
+            (command.status == .failed &&
+                command.lastError == OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError)
+    }
+
+    private static func deliveryTarget(for command: OpenClawChatOutboxCommand) -> OutboxDeliveryTarget {
+        OutboxDeliveryTarget(
+            presentationSessionKey: command.sessionKey,
+            deliverySessionKey: command.deliverySessionKey,
+            agentID: command.agentID)
+    }
+
+    private func parkOutboxCommandWithUnconfirmedDelivery(
+        _ command: OpenClawChatOutboxCommand,
+        outbox: any OpenClawChatCommandOutbox) async -> OpenClawChatOutboxUpdateResult
+    {
+        let update = await outbox.markCommandFailedIfPresent(
+            id: command.id,
+            retryCount: command.retryCount,
+            lastError: OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError)
+        switch update {
+        case .updated:
+            self.setOutboxState(
+                .failed(reason: OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError),
+                forCommandID: command.id)
+        case .missing, .confirmed:
+            self.clearOutboxState(forCommandID: command.id)
+        case .unavailable:
+            self.applyTransportHealth(false)
+        }
+        return update
     }
 
     private func parkOutboxCommandForChangedTarget(

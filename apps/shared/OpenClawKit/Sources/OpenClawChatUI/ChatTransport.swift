@@ -89,6 +89,12 @@ public enum OpenClawChatTransportRouteLeaseResult: Sendable {
     case unavailable(reason: String?)
 }
 
+/// The transport rejected a send before it reached its request channel. This
+/// is the only failure class safe for automatic outbox retry.
+public enum OpenClawChatTransportSendError: Error, Sendable {
+    case notDispatched
+}
+
 public enum OpenClawChatTransportUpgradeMessage {
     public static let routingContract =
         "Update the gateway before sending queued messages. This version requires safe delivery routing."

@@ -126,7 +126,8 @@ struct IOSGatewayChatTransportTests {
 
     @Test func `models list response decodes choices and falls back blank names`() throws {
         let data = Data(
-            #"{"models":[{"id":"claude-opus-4","name":"Claude Opus 4","provider":"anthropic","contextWindow":200000,"reasoning":true},{"id":"gpt-5","name":"  ","provider":"openai","extra":"ignored"}]}"#.utf8)
+            #"{"models":[{"id":"claude-opus-4","name":"Claude Opus 4","provider":"anthropic","contextWindow":200000,"reasoning":true},{"id":"gpt-5","name":"  ","provider":"openai","extra":"ignored"}]}"#
+                .utf8)
         let choices = try IOSGatewayChatTransport.decodeModelChoices(data)
 
         #expect(choices.count == 2)
@@ -249,6 +250,22 @@ struct IOSGatewayChatTransportTests {
                 attachments: [])
             Issue.record("Expected sendMessage to throw when gateway not connected")
         } catch {}
+
+        do {
+            _ = try await transport.sendMessage(
+                sessionKey: "node-test",
+                agentID: "main",
+                expectedSessionRoutingContract: "per-sender|main|main",
+                message: "hello",
+                thinking: "low",
+                idempotencyKey: "guarded-idempotency",
+                attachments: [])
+            Issue.record("Expected guarded sendMessage to fail before dispatch")
+        } catch is OpenClawChatTransportSendError {
+            // Expected: a missing route never reached chat.send.
+        } catch {
+            Issue.record("Expected a typed pre-dispatch failure, got \(error)")
+        }
 
         do {
             _ = try await transport.requestHealth(timeoutMs: 250)

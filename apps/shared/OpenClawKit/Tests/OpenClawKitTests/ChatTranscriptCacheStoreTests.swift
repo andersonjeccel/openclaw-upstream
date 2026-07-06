@@ -462,6 +462,7 @@ struct ChatTranscriptCacheStoreTests {
             status: .failed,
             retryCount: 1,
             lastError: "failed")))
+        #expect(await store.loadCommands().first?.lastError == "failed")
 
         #expect(await store.markCommandRetriedIfPresent(
             id: "c-unknown",
