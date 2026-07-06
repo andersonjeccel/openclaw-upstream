@@ -308,6 +308,9 @@ private func queuedStateCount(_ vm: OpenClawChatViewModel) -> Int {
 private actor DelayingOutbox: OpenClawChatCommandOutbox {
     private let base: OpenClawChatSQLiteTranscriptCache
     private var loadDelayNanoseconds: UInt64 = 0
+    private var recoveryAvailable = true
+    private var terminalWritesAvailable = true
+    private let recoveryAttempted = DeleteGate()
 
     init(base: OpenClawChatSQLiteTranscriptCache) {
         self.base = base
@@ -315,6 +318,18 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
 
     func setLoadDelayNanoseconds(_ delay: UInt64) {
         self.loadDelayNanoseconds = delay
+    }
+
+    func setRecoveryAvailable(_ available: Bool) {
+        self.recoveryAvailable = available
+    }
+
+    func setTerminalWritesAvailable(_ available: Bool) {
+        self.terminalWritesAvailable = available
+    }
+
+    func waitUntilRecoveryAttempted() async {
+        await self.recoveryAttempted.wait()
     }
 
     func enqueueCommand(_ command: OpenClawChatOutboxCommand) async -> Bool {
@@ -328,9 +343,18 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
         return await self.base.loadCommands()
     }
 
+    func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]? {
+        if self.loadDelayNanoseconds > 0 {
+            try? await Task.sleep(nanoseconds: self.loadDelayNanoseconds)
+        }
+        return await self.base.loadCommandsIfAvailable()
+    }
+
     @discardableResult
     func recoverInterruptedSends() async -> Bool {
-        await self.base.recoverInterruptedSends()
+        await self.recoveryAttempted.open()
+        guard self.recoveryAvailable else { return false }
+        return await self.base.recoverInterruptedSends()
     }
 
     func claimNextCommand() async -> OpenClawChatOutboxCommand? {
@@ -347,6 +371,15 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
 
     func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
         await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandFailedIfPresent(
+        id: String,
+        retryCount: Int,
+        lastError: String?) async -> OpenClawChatOutboxUpdateResult
+    {
+        guard self.terminalWritesAvailable else { return .unavailable }
+        return await self.base.markCommandFailedIfPresent(id: id, retryCount: retryCount, lastError: lastError)
     }
 
     func markCommandRetried(id: String) async {
@@ -402,6 +435,16 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
         return commands
     }
 
+    func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]? {
+        guard let commands = await self.base.loadCommandsIfAvailable() else { return nil }
+        if self.shouldHoldNextLoad {
+            self.shouldHoldNextLoad = false
+            await self.captured.open()
+            await self.release.wait()
+        }
+        return commands
+    }
+
     @discardableResult
     func recoverInterruptedSends() async -> Bool {
         await self.base.recoverInterruptedSends()
@@ -421,6 +464,14 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
 
     func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
         await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandFailedIfPresent(
+        id: String,
+        retryCount: Int,
+        lastError: String?) async -> OpenClawChatOutboxUpdateResult
+    {
+        await self.base.markCommandFailedIfPresent(id: id, retryCount: retryCount, lastError: lastError)
     }
 
     func markCommandRetried(id: String) async {
@@ -471,6 +522,10 @@ private actor CancellationHoldingOutbox: OpenClawChatCommandOutbox {
         await self.base.loadCommands()
     }
 
+    func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]? {
+        await self.base.loadCommandsIfAvailable()
+    }
+
     @discardableResult
     func recoverInterruptedSends() async -> Bool {
         await self.base.recoverInterruptedSends()
@@ -490,6 +545,14 @@ private actor CancellationHoldingOutbox: OpenClawChatCommandOutbox {
 
     func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
         await self.base.markCommandFailed(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandFailedIfPresent(
+        id: String,
+        retryCount: Int,
+        lastError: String?) async -> OpenClawChatOutboxUpdateResult
+    {
+        await self.base.markCommandFailedIfPresent(id: id, retryCount: retryCount, lastError: lastError)
     }
 
     func markCommandRetried(id: String) async {
@@ -548,6 +611,21 @@ struct ChatViewModelOutboxTests {
             }
         }
         #expect(await userTexts(vm2) == ["hello offline"])
+    }
+
+    @Test func `unavailable recovery keeps the live send FIFO gate closed`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let outbox = DelayingOutbox(base: store)
+        await outbox.setRecoveryAvailable(false)
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: outbox)
+
+        await MainActor.run { vm.load() }
+        await outbox.waitUntilRecoveryAttempted()
+
+        #expect(await MainActor.run { !vm.hasRestoredOutboxMessages })
     }
 
     @Test func `reconnect flushes queued commands in order with their idempotency keys`() async throws {
@@ -851,6 +929,38 @@ struct ChatViewModelOutboxTests {
             await store.loadCommands().isEmpty
         }
         #expect(await transport.state.sentIdempotencyKeys.count == 1)
+    }
+
+    @Test func `unavailable terminal write drops health instead of advancing FIFO`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+            id: "c-terminal-write",
+            sessionKey: "main",
+            text: "do not skip me",
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .queued,
+            retryCount: OpenClawChatViewModel.maxOutboxSendAttempts - 1,
+            lastError: "rejected")))
+        let outbox = DelayingOutbox(base: store)
+        await outbox.setTerminalWritesAvailable(false)
+        let transport = OutboxTestTransport(healthy: false)
+        await transport.state.setSendRejects(true)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: outbox)
+
+        await MainActor.run { vm.load() }
+        await transport.goOnline()
+
+        try await waitUntil("terminal write failure closes health with claim intact") {
+            let status = await store.loadCommands().first?.status
+            let healthDown = await MainActor.run { !vm.healthOK }
+            return status == .sending && healthDown
+        }
+        #expect(await MainActor.run {
+            vm.messages.allSatisfy { vm.outboxState(for: $0.id)?.isFailed != true }
+        })
     }
 
     @Test func `gateway response errors are definitive and burn retry attempts`() async throws {

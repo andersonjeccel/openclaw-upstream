@@ -175,10 +175,10 @@ extension OpenClawChatViewModel {
         guard let outbox else { return }
         Task { [weak self] in
             guard let self else { return }
-            await self.recoverInterruptedOutboxSendsIfNeeded()
+            guard await self.recoverInterruptedOutboxSendsIfNeeded() else { return }
             while self.isCurrentSession(session) {
                 let presentationGeneration = self.outboxPresentationGeneration
-                let commands = await outbox.loadCommands()
+                guard let commands = await outbox.loadCommandsIfAvailable() else { return }
                 guard self.isCurrentSession(session) else { return }
                 if presentationGeneration != self.outboxPresentationGeneration {
                     // A cross-view cancellation/confirmation invalidated this
@@ -353,7 +353,10 @@ extension OpenClawChatViewModel {
             self.applyTransportHealth(false)
             return
         }
-        await self.recoverInterruptedOutboxSendsIfNeeded()
+        guard await self.recoverInterruptedOutboxSendsIfNeeded() else {
+            self.applyTransportHealth(false)
+            return
+        }
         var confirmationSessionKeys: Set<String> = []
         while self.healthOK {
             let presentationGeneration = self.outboxPresentationGeneration
@@ -481,8 +484,21 @@ extension OpenClawChatViewModel {
         outboxLogger.error("outbox flush send rejected \(reason, privacy: .public)")
         let attempts = command.retryCount + 1
         if attempts >= Self.maxOutboxSendAttempts {
-            await outbox.markCommandFailed(id: command.id, retryCount: attempts, lastError: reason)
-            self.setOutboxState(.failed(reason: reason), forCommandID: command.id)
+            let update = await outbox.markCommandFailedIfPresent(
+                id: command.id,
+                retryCount: attempts,
+                lastError: reason)
+            guard update != .unavailable else {
+                self.applyTransportHealth(false)
+                return false
+            }
+            if update == .updated {
+                self.setOutboxState(.failed(reason: reason), forCommandID: command.id)
+            } else {
+                // Canonical history may have removed the claimed row while
+                // the rejection was in flight.
+                self.clearOutboxState(forCommandID: command.id)
+            }
             // Terminal failure needs user action; let younger commands
             // flush instead of blocking behind it forever.
             return true
@@ -525,11 +541,11 @@ extension OpenClawChatViewModel {
         await transcriptCache.storeTranscript(sessionKey: command.sessionKey, messages: cached)
     }
 
-    private func recoverInterruptedOutboxSendsIfNeeded() async {
-        guard let outbox else { return }
+    private func recoverInterruptedOutboxSendsIfNeeded() async -> Bool {
+        guard let outbox else { return false }
         // The store owns the once-per-process gate so overlapping/replacement
         // view models cannot reset another active sender's claim.
-        _ = await outbox.recoverInterruptedSends()
+        return await outbox.recoverInterruptedSends()
     }
 
     private func setOutboxState(_ state: OpenClawChatOutboxMessageState, forCommandID commandID: String) {

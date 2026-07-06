@@ -183,9 +183,13 @@ public protocol OpenClawChatCommandOutbox: Sendable {
     /// old queued or unconfirmed rows become failed so reconnect never sends
     /// stale or ambiguously delivered commands silently.
     func loadCommands() async -> [OpenClawChatOutboxCommand]
-    /// Crash safety: rows stuck in 'sending' from a previous process revert
-    /// to 'queued' once per store lifetime; acknowledged rows stay awaiting
-    /// canonical history confirmation and are never replayed automatically.
+    /// Availability-aware read used by the FIFO restoration gate. Nil means
+    /// storage was not readable, not that the queue was empty.
+    func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]?
+    /// Crash safety: rows stuck in 'sending' from a previous process become
+    /// failed once per store lifetime. Delivery is ambiguous after a crash,
+    /// so only explicit user retry may replay them; acknowledged rows stay
+    /// awaiting canonical history confirmation.
     /// Returns false while storage is unavailable so callers can retry later.
     @discardableResult
     func recoverInterruptedSends() async -> Bool
@@ -195,6 +199,12 @@ public protocol OpenClawChatCommandOutbox: Sendable {
     func markCommandQueued(id: String, retryCount: Int, lastError: String?) async
     func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult
     func markCommandFailed(id: String, retryCount: Int, lastError: String?) async
+    /// Result-bearing terminal transition for callers that must stop their
+    /// FIFO when durable storage is unavailable.
+    func markCommandFailedIfPresent(
+        id: String,
+        retryCount: Int,
+        lastError: String?) async -> OpenClawChatOutboxUpdateResult
     /// Explicit user retry: reset attempts and refresh `createdAt` so an
     /// expired row can send again (retry is new intent, so it also moves the
     /// command to the queue tail rather than replaying its old position).
@@ -214,6 +224,22 @@ public protocol OpenClawChatCommandOutbox: Sendable {
 }
 
 extension OpenClawChatCommandOutbox {
+    public func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]? {
+        // The legacy API cannot distinguish an empty queue from unreadable
+        // storage. Only an explicit conformer override may open the FIFO gate.
+        nil
+    }
+
+    public func markCommandFailedIfPresent(
+        id: String,
+        retryCount: Int,
+        lastError: String?) async -> OpenClawChatOutboxUpdateResult
+    {
+        // Preserve source compatibility without inventing durable success:
+        // legacy conformers cannot report availability or row eligibility.
+        .unavailable
+    }
+
     public func cancelCommand(id _: String) async -> OpenClawChatOutboxUpdateResult {
         // A legacy conformer cannot prove atomic status eligibility. Refuse
         // cancellation instead of hiding a row whose send may still land.
@@ -452,10 +478,11 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
 
     public func enqueueCommand(_ command: OpenClawChatOutboxCommand) async -> Bool {
         guard !self.isRetired, let db = await self.handle() else { return false }
-        let count = self.selectInt(
+        guard let count = self.selectInt(
             db,
             sql: "SELECT COUNT(*) FROM outbox_commands WHERE gateway_id = ?1",
-            bindings: [self.gatewayID]) ?? 0
+            bindings: [self.gatewayID])
+        else { return false }
         // Bound the queue per gateway across all statuses so failed rows also
         // count: the user must clear them before queueing more.
         guard count < Self.maxQueuedCommands else { return false }
@@ -479,8 +506,12 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     }
 
     public func loadCommands() async -> [OpenClawChatOutboxCommand] {
-        guard !self.isRetired, let db = await self.handle() else { return [] }
-        guard self.applyOutboxStaleness(db) else { return [] }
+        await self.loadCommandsIfAvailable() ?? []
+    }
+
+    public func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]? {
+        guard !self.isRetired, let db = await self.handle() else { return nil }
+        guard self.applyOutboxStaleness(db) else { return nil }
         return self.readCommands(db)
     }
 
@@ -491,8 +522,11 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         guard let db = await self.handle() else { return false }
         let recovered = self.execute(
             db,
-            sql: "UPDATE outbox_commands SET status = 'queued' WHERE gateway_id = ?1 AND status = 'sending'",
-            bindings: [self.gatewayID])
+            sql: """
+            UPDATE outbox_commands SET status = 'failed', last_error = ?2
+            WHERE gateway_id = ?1 AND status = 'sending'
+            """,
+            bindings: [self.gatewayID, Self.outboxUnconfirmedError])
         if recovered {
             self.hasRecoveredInterruptedSends = true
         }
@@ -519,7 +553,8 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             committed = self.execute(db, sql: "COMMIT", bindings: [])
             return nil
         }
-        guard var next = self.readCommands(db).first(where: { $0.status == .queued }) else {
+        guard let commands = self.readCommands(db) else { return nil }
+        guard var next = commands.first(where: { $0.status == .queued }) else {
             committed = self.execute(db, sql: "COMMIT", bindings: [])
             return nil
         }
@@ -542,7 +577,10 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     }
 
     public func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult {
-        guard !self.isRetired, let db = await self.handle() else { return .unavailable }
+        guard !self.isRetired, let db = await self.handle() else {
+            self.hasRecoveredInterruptedSends = false
+            return .unavailable
+        }
         let updated = self.execute(
             db,
             sql: """
@@ -550,12 +588,46 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
             WHERE gateway_id = ?1 AND client_uuid = ?2 AND status = 'sending'
             """,
             bindings: [self.gatewayID, id])
-        guard updated else { return .unavailable }
+        guard updated else {
+            // The claimed row may still be `sending`; a later healthy pass
+            // must fail it closed within this store lifetime.
+            self.hasRecoveredInterruptedSends = false
+            return .unavailable
+        }
         return sqlite3_changes(db) > 0 ? .updated : .missing
     }
 
     public func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
-        await self.updateCommandStatus(id: id, status: "failed", retryCount: retryCount, lastError: lastError)
+        await self.updateCommandStatus(
+            id: id,
+            status: "failed",
+            retryCount: retryCount,
+            lastError: lastError)
+    }
+
+    public func markCommandFailedIfPresent(
+        id: String,
+        retryCount: Int,
+        lastError: String?) async -> OpenClawChatOutboxUpdateResult
+    {
+        guard !self.isRetired, let db = await self.handle() else {
+            self.hasRecoveredInterruptedSends = false
+            return .unavailable
+        }
+        let updated = self.execute(
+            db,
+            sql: """
+            UPDATE outbox_commands SET status = 'failed', retry_count = ?3, last_error = ?4
+            WHERE gateway_id = ?1 AND client_uuid = ?2 AND status = 'sending'
+            """,
+            bindings: [self.gatewayID, id, retryCount, lastError ?? ""])
+        guard updated else {
+            // The caller must stop this flush pass until storage is healthy;
+            // otherwise a durable `sending` row can block the FIFO silently.
+            self.hasRecoveredInterruptedSends = false
+            return .unavailable
+        }
+        return sqlite3_changes(db) > 0 ? .updated : .missing
     }
 
     public func markCommandRetried(id: String) async {
@@ -657,14 +729,20 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
     }
 
     private func updateCommandStatus(id: String, status: String, retryCount: Int, lastError: String?) async {
-        guard !self.isRetired, let db = await self.handle() else { return }
-        self.execute(
+        guard !self.isRetired, let db = await self.handle() else {
+            self.hasRecoveredInterruptedSends = false
+            return
+        }
+        let updated = self.execute(
             db,
             sql: """
             UPDATE outbox_commands SET status = ?3, retry_count = ?4, last_error = ?5
             WHERE gateway_id = ?1 AND client_uuid = ?2
             """,
             bindings: [self.gatewayID, id, status, retryCount, lastError ?? ""])
+        if !updated {
+            self.hasRecoveredInterruptedSends = false
+        }
     }
 
     private func applyOutboxStaleness(_ db: OpaquePointer) -> Bool {
@@ -968,41 +1046,43 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache, Ope
         return Int(sqlite3_column_int64(statement, 0))
     }
 
-    private func readCommands(_ db: OpaquePointer) -> [OpenClawChatOutboxCommand] {
+    private func readCommands(_ db: OpaquePointer) -> [OpenClawChatOutboxCommand]? {
         var statement: OpaquePointer?
         let sql = """
         SELECT client_uuid, session_key, text, thinking, created_at, status, retry_count, last_error
         FROM outbox_commands WHERE gateway_id = ?1
         ORDER BY created_at ASC, id ASC
         """
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(statement) }
-        guard self.bind(statement, bindings: [self.gatewayID]) else { return [] }
+        guard self.bind(statement, bindings: [self.gatewayID]) else { return nil }
 
         var commands: [OpenClawChatOutboxCommand] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let id = sqlite3_column_text(statement, 0),
-                  let sessionKey = sqlite3_column_text(statement, 1),
-                  let text = sqlite3_column_text(statement, 2)
-            else { continue }
-            let thinking = sqlite3_column_text(statement, 3).map { String(cString: $0) } ?? ""
-            let statusRaw = sqlite3_column_text(statement, 5).map { String(cString: $0) } ?? ""
-            let lastError = sqlite3_column_text(statement, 7).map { String(cString: $0) } ?? ""
-            guard let status = OpenClawChatOutboxCommand.Status(rawValue: statusRaw) else {
-                // Unknown persistent states need a migration, never an implicit replay.
-                continue
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            if let id = sqlite3_column_text(statement, 0),
+               let sessionKey = sqlite3_column_text(statement, 1),
+               let text = sqlite3_column_text(statement, 2)
+            {
+                let thinking = sqlite3_column_text(statement, 3).map { String(cString: $0) } ?? ""
+                let statusRaw = sqlite3_column_text(statement, 5).map { String(cString: $0) } ?? ""
+                let lastError = sqlite3_column_text(statement, 7).map { String(cString: $0) } ?? ""
+                if let status = OpenClawChatOutboxCommand.Status(rawValue: statusRaw) {
+                    commands.append(
+                        OpenClawChatOutboxCommand(
+                            id: String(cString: id),
+                            sessionKey: String(cString: sessionKey),
+                            text: String(cString: text),
+                            thinking: thinking,
+                            createdAt: sqlite3_column_double(statement, 4),
+                            status: status,
+                            retryCount: Int(sqlite3_column_int64(statement, 6)),
+                            lastError: lastError.isEmpty ? nil : lastError))
+                }
             }
-            commands.append(
-                OpenClawChatOutboxCommand(
-                    id: String(cString: id),
-                    sessionKey: String(cString: sessionKey),
-                    text: String(cString: text),
-                    thinking: thinking,
-                    createdAt: sqlite3_column_double(statement, 4),
-                    status: status,
-                    retryCount: Int(sqlite3_column_int64(statement, 6)),
-                    lastError: lastError.isEmpty ? nil : lastError))
+            step = sqlite3_step(statement)
         }
+        guard step == SQLITE_DONE else { return nil }
         return commands
     }
 

@@ -527,7 +527,7 @@ struct ChatCommandOutboxStoreTests {
         #expect(await store.loadCommands().map(\.id) == ["c-cache"])
     }
 
-    @Test func `interrupted sending rows revert to queued on recovery`() async throws {
+    @Test func `interrupted sending rows fail closed on recovery`() async throws {
         let url = try makeDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         do {
@@ -537,16 +537,114 @@ struct ChatCommandOutboxStoreTests {
             #expect(await store.loadCommands().map(\.status) == [.sending])
         }
 
-        // Simulated crash mid-send: a fresh process recovers the row to
-        // queued; the idempotency key makes the re-send safe.
+        // Simulated crash mid-send: the durable result is ambiguous, so a
+        // fresh process requires explicit user retry instead of replaying it.
         let reopened = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
         #expect(await reopened.recoverInterruptedSends())
-        #expect(await reopened.loadCommands().map(\.status) == [.queued])
+        let recovered = await reopened.loadCommands()
+        #expect(recovered.map(\.status) == [.failed])
+        #expect(recovered.map(\.lastError) == [OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError])
 
         // An unreachable store must report failure so callers do not burn
         // their once-per-launch recovery gate while the DB is locked.
         await reopened.retire()
         #expect(await !reopened.recoverInterruptedSends())
+    }
+
+    @Test func `failed post-claim transition reopens same-process recovery`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-claim", text: "recover me")))
+        #expect(await store.recoverInterruptedSends())
+        #expect(await store.claimNextCommand()?.id == "c-claim")
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands RENAME TO outbox_commands_unavailable",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        #expect(await store.markCommandAwaitingConfirmation(id: "c-claim") == .unavailable)
+
+        raw = nil
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands_unavailable RENAME TO outbox_commands",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        #expect(await store.recoverInterruptedSends())
+        #expect(await store.loadCommands().map(\.status) == [.failed])
+    }
+
+    @Test func `failed terminal transition reports unavailable and reopens recovery`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-terminal", text: "stop retrying")))
+        #expect(await store.recoverInterruptedSends())
+        #expect(await store.claimNextCommand()?.id == "c-terminal")
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands RENAME TO outbox_commands_unavailable",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        #expect(
+            await store.markCommandFailedIfPresent(id: "c-terminal", retryCount: 3, lastError: "rejected") ==
+                .unavailable)
+
+        raw = nil
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands_unavailable RENAME TO outbox_commands",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        #expect(await store.recoverInterruptedSends())
+        let command = await store.loadCommands().first
+        #expect(command?.status == .failed)
+        #expect(command?.retryCount == 0)
+        #expect(command?.lastError == OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError)
+    }
+
+    @Test func `unknown row status is skipped without blocking later commands`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(outboxCommand(id: "c-valid", text: "send me", createdAt: 2)))
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            """
+            INSERT INTO outbox_commands(
+                client_uuid, gateway_id, session_key, text, thinking, created_at, status, retry_count, last_error
+            ) VALUES ('c-unknown', 'gw-a', 'main', 'skip me', 'off', 1, 'future_status', 0, '')
+            """,
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        #expect(await store.loadCommands().map(\.id) == ["c-valid"])
     }
 
     @Test func `queued commands expire to failed at the staleness boundary`() async throws {
@@ -610,7 +708,8 @@ struct ChatCommandOutboxStoreTests {
         #expect(await storeB.loadCommands().isEmpty)
 
         // Cross-gateway mutations must not leak either.
-        await storeB.markCommandFailed(id: "c-a", retryCount: 3, lastError: "boom")
+        #expect(
+            await storeB.markCommandFailedIfPresent(id: "c-a", retryCount: 3, lastError: "boom") == .missing)
         #expect(await storeB.cancelCommand(id: "c-a") == .missing)
         let survivors = await storeA.loadCommands()
         #expect(survivors.map(\.id) == ["c-a"])
@@ -629,6 +728,7 @@ struct ChatCommandOutboxStoreTests {
         #expect(loaded.map(\.retryCount) == [2])
         #expect(loaded.map(\.lastError) == ["socket closed"])
 
+        // Legacy public operation remains unconditional for queued rows.
         await store.markCommandFailed(id: "c-1", retryCount: 3, lastError: "gave up")
         loaded = await store.loadCommands()
         #expect(loaded.map(\.status) == [.failed])

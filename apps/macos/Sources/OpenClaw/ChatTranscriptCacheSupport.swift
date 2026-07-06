@@ -9,6 +9,11 @@ import OpenClawChatUI
 /// classes (the iOS store applies `completeUntilFirstUserAuthentication`);
 /// at-rest protection here is the per-user container permissions plus FileVault.
 enum MacChatTranscriptCache {
+    /// Every chat window for one gateway must share the same outbox actor.
+    /// Otherwise a newly opened window can mistake another live window's
+    /// claimed send for crash residue during its first recovery pass.
+    @MainActor private static var storesByGatewayID: [String: OpenClawChatSQLiteTranscriptCache] = [:]
+
     /// Stable identity of the gateway this app talks to, derivable offline
     /// (the cache pre-paints before any connection is up). Keys must not
     /// collide across gateways:
@@ -73,6 +78,7 @@ enum MacChatTranscriptCache {
     /// resolved, so foreign rows can never leak into another gateway's scope.
     /// Concrete return type: the same SQLite store also backs the offline
     /// command outbox, and callers wire both protocol facets from one instance.
+    @MainActor
     static func make() -> OpenClawChatSQLiteTranscriptCache? {
         let root = OpenClawConfigFile.loadDict()
         let mode = ConnectionModeResolver.resolve(root: root).mode
@@ -98,6 +104,16 @@ enum MacChatTranscriptCache {
             return nil
         }
         let databaseURL = base.appendingPathComponent("OpenClaw/chat-cache.sqlite", isDirectory: false)
-        return OpenClawChatSQLiteTranscriptCache(databaseURL: databaseURL, gatewayID: gatewayID)
+        return self.store(databaseURL: databaseURL, gatewayID: gatewayID)
+    }
+
+    @MainActor
+    static func store(databaseURL: URL, gatewayID: String) -> OpenClawChatSQLiteTranscriptCache {
+        if let store = self.storesByGatewayID[gatewayID] {
+            return store
+        }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: databaseURL, gatewayID: gatewayID)
+        self.storesByGatewayID[gatewayID] = store
+        return store
     }
 }
