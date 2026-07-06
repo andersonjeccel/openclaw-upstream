@@ -714,6 +714,7 @@ class NodeRuntime private constructor(
   private val voiceCaptureOwnershipEpoch = AtomicLong()
   private val talkPttCommandEpoch = AtomicLong()
   private val talkPttOwnership = AtomicReference<TalkPttOwnership?>()
+
   // Keep ownership epochs and their service/capture state transitions atomic.
   // Otherwise stale PTT cleanup can pass its epoch check before a UI mode change.
   private val voiceCaptureOwnershipLock = Any()
@@ -810,6 +811,7 @@ class NodeRuntime private constructor(
       onEvent = { event, payloadJson ->
         handleGatewayEvent(event, payloadJson)
       },
+      customHeadersProvider = prefs::loadGatewayCustomHeaders,
     )
 
   private suspend fun subscribeOperatorSessionEvents() {
@@ -874,6 +876,7 @@ class NodeRuntime private constructor(
       onTlsFingerprint = { stableId, fingerprint ->
         prefs.saveGatewayTlsFingerprint(stableId, fingerprint)
       },
+      customHeadersProvider = prefs::loadGatewayCustomHeaders,
     )
 
   /**
