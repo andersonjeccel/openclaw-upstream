@@ -173,7 +173,7 @@ struct ChatProTab: View {
             self.viewModelTransportModeID = transportModeID
             self.viewModelTransportAgentID = transportAgentID
             self.viewModelAgentID = agentID
-            self.viewModel = self.makeChatViewModel(sessionKey: sessionKey, activeAgentId: agentID)
+            self.viewModel = self.makeChatViewModel(sessionKey: sessionKey)
             return
         }
         if self.viewModelTransportModeID != transportModeID ||
@@ -183,21 +183,21 @@ struct ChatProTab: View {
             self.viewModelTransportModeID = transportModeID
             self.viewModelTransportAgentID = transportAgentID
             self.viewModelAgentID = agentID
-            self.viewModel = self.makeChatViewModel(sessionKey: sessionKey, activeAgentId: agentID)
+            self.viewModel = self.makeChatViewModel(sessionKey: sessionKey)
             return
         }
         guard viewModel.sessionKey != sessionKey else { return }
         viewModel.syncSession(to: sessionKey)
     }
 
-    private func makeChatViewModel(sessionKey: String, activeAgentId: String? = nil) -> OpenClawChatViewModel {
+    private func makeChatViewModel(sessionKey: String) -> OpenClawChatViewModel {
         // One store instance backs both seams so the transcript cache and the
         // offline outbox share a single SQLite connection.
         let offlineStore = self.appModel.makeChatOfflineStore()
         return OpenClawChatViewModel(
             sessionKey: sessionKey,
             transport: self.appModel.makeChatTransport(),
-            activeAgentId: activeAgentId,
+            activeAgentId: self.activeAgentID,
             transcriptCache: offlineStore,
             outbox: offlineStore,
             onSessionChanged: { sessionKey in

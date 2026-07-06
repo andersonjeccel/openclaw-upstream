@@ -1,4 +1,5 @@
 import Foundation
+import OpenClawKit
 import OSLog
 
 private let outboxLogger = Logger(subsystem: "ai.openclaw", category: "OpenClawChatOutbox")
@@ -7,19 +8,23 @@ private let outboxLogger = Logger(subsystem: "ai.openclaw", category: "OpenClawC
 public enum OpenClawChatOutboxMessageState: Equatable, Sendable {
     case queued
     case sending
+    case confirming
     case failed(reason: String?)
 
     public var isFailed: Bool {
         if case .failed = self { return true }
         return false
     }
+
+    var preventsDeletion: Bool {
+        self == .sending || self == .confirming
+    }
 }
 
 // Durable offline command outbox. Sends made while the gateway is unhealthy
 // are persisted (per gateway, alongside the transcript cache) and flushed
-// strictly in createdAt order when health recovers. Each command's client
-// UUID rides as the transport idempotency key, so at-least-once flushing plus
-// gateway dedupe keeps the transcript exact.
+// strictly in createdAt order when health recovers. A gateway ACK only moves
+// a row to awaiting-confirmation; canonical history owns durable completion.
 extension OpenClawChatViewModel {
     public func outboxState(for messageID: UUID) -> OpenClawChatOutboxMessageState? {
         self.outboxStatesByMessageID[messageID]
@@ -156,6 +161,25 @@ extension OpenClawChatViewModel {
         }
     }
 
+    /// Canonical history is the durable acceptance boundary. Any matching
+    /// outbox row—including a lost-ACK queued row—is now safe to remove
+    /// without replaying the user turn.
+    func confirmOutboxCommands(in messages: [OpenClawChatMessage], session: SessionSnapshot) {
+        guard let outbox else { return }
+        let confirmedKeys = Set(messages.compactMap { Self.normalizedIdempotencyKey($0.idempotencyKey) })
+        guard !confirmedKeys.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let commands = await outbox.loadCommands().filter { command in
+                command.sessionKey == session.key && confirmedKeys.contains(Self.outboxUserIdempotencyKey(command.id))
+            }
+            for command in commands {
+                await outbox.deleteCommand(id: command.id)
+                self.clearOutboxState(forCommandID: command.id)
+            }
+        }
+    }
+
     /// Appends bubbles for commands in the current session, adopting rows
     /// that already carry the command's user idempotency key (cache pre-paint
     /// or an earlier restore), and refreshes their display states.
@@ -268,41 +292,20 @@ extension OpenClawChatViewModel {
         guard let outbox else { return }
         await self.recoverInterruptedOutboxSendsIfNeeded()
         var flushedCurrentSession = false
-        // One attempt per command per pass: if a delete/mark write ever fails
-        // (broken store), the pass ends instead of re-sending in a hot loop.
-        var attemptedCommandIDs = Set<String>()
         while self.healthOK {
             let commands = await outbox.loadCommands()
             self.presentOutboxCommands(commands.filter { $0.sessionKey == self.sessionKey })
-            guard let next = commands.first(where: {
-                $0.status == .queued && !attemptedCommandIDs.contains($0.id)
-            }) else { break }
-            attemptedCommandIDs.insert(next.id)
-            // Delete-vs-flush race: the user may have removed this bubble
-            // after the pass loaded its snapshot. The tombstone catches the
-            // synchronous UI delete; the claiming UPDATE (zero rows changed
-            // = row already gone) catches the DB-side delete. Either way the
-            // command must not be sent. The tombstone is not consumed here:
-            // it lives until the delete task confirms the row is durably
-            // gone, so retries and later passes stay covered too.
-            if self.deletedOutboxCommandIDs.contains(next.id) {
-                self.clearOutboxState(forCommandID: next.id)
-                continue
-            }
+            guard let next = await outbox.claimNextCommand() else { break }
             // Same ordering contract as the live send path: a run must not
             // start on a stale model while a sessions.patch(model) for its
             // session is still in flight.
             await self.waitForPendingModelPatches(in: next.sessionKey)
-            guard await outbox.markCommandSending(id: next.id) else {
-                self.clearOutboxState(forCommandID: next.id)
-                continue
-            }
-            // The claim awaited off the main actor: a user delete may have
-            // landed during that suspension (tombstone set, row deletion in
-            // flight). Recheck before the transport call; the delete task
-            // owns the durable removal and drops the tombstone once the row
-            // is gone, even though the claim re-marked it 'sending'.
+            // Delete may race the atomic claim while it is awaiting the store.
+            // Delete durably before continuing so younger rows cannot strand
+            // behind a sending tombstone.
             if self.deletedOutboxCommandIDs.contains(next.id) {
+                await outbox.deleteCommand(id: next.id)
+                self.deletedOutboxCommandIDs.remove(next.id)
                 self.clearOutboxState(forCommandID: next.id)
                 continue
             }
@@ -325,34 +328,43 @@ extension OpenClawChatViewModel {
                         reason: "Run failed to start (\(response.status)).")
                     if handled { continue } else { break }
                 }
-                // Ack: drop the durable row. The queued bubble stays and is
-                // adopted by the durable session.message/history row via the
-                // shared idempotency key, so no duplicate turn appears.
-                //
                 // Deliberately no pendingRuns adoption for background flushes:
                 // the reply still lands via handleChatEvent's external-run
                 // final branch (session-scoped, run-id independent),
                 // handleSessionMessageEvent, and the post-drain history
                 // refresh below. Run tracking (typing indicator, streaming,
                 // timeouts) stays owned by interactive performSend.
-                // Close the crash window between ack and the next canonical
-                // history write-through: splice the sent turn into the
-                // session's cached transcript before the outbox row goes
-                // away, so a cold offline reopen still shows it. Await the
-                // chained cache writes first so an in-flight older snapshot
-                // cannot land after the splice and drop the turn.
+                // chat.send ACK precedes durable user-turn persistence. Keep
+                // the outbox row until history carries its idempotency key;
+                // the cache splice makes the acknowledged turn visible while
+                // canonical history catches up.
                 await self.pendingCacheWriteTask?.value
                 await self.spliceSentCommandIntoCachedTranscript(next)
-                // From here the outbox row is the turn's last durable copy;
-                // remember its key so a lagging history snapshot cannot
-                // evict the visible row before confirming it.
-                self.recentlySentOutboxUserKeys.insert(Self.outboxUserIdempotencyKey(next.id))
-                await outbox.deleteCommand(id: next.id)
-                self.clearOutboxState(forCommandID: next.id)
+                let confirmationUpdate = await outbox.markCommandAwaitingConfirmation(id: next.id)
+                if confirmationUpdate == .unavailable {
+                    self.applyTransportHealth(false)
+                    break
+                }
+                if confirmationUpdate == .updated {
+                    self.setOutboxState(.confirming, forCommandID: next.id)
+                } else {
+                    // A concurrent canonical history/session.message
+                    // confirmation already removed the row.
+                    self.clearOutboxState(forCommandID: next.id)
+                }
                 self.outboxTransportFailureStreak = 0
                 if next.sessionKey == self.sessionKey {
                     flushedCurrentSession = true
                 }
+            } catch let error as GatewayResponseError {
+                // A response error proves the gateway rejected the request;
+                // unlike a socket/timeout failure, replay cannot duplicate an
+                // accepted run and should consume the normal retry budget.
+                let handled = await self.recordOutboxRejection(
+                    of: next,
+                    outbox: outbox,
+                    reason: error.localizedDescription)
+                if handled { continue } else { break }
             } catch {
                 // Transport-level failure (unreachable, socket drop): a
                 // connectivity blip, not a gateway verdict on the command.
@@ -445,14 +457,10 @@ extension OpenClawChatViewModel {
     }
 
     private func recoverInterruptedOutboxSendsIfNeeded() async {
-        guard let outbox, !self.hasRecoveredInterruptedOutboxSends else { return }
-        // Burn the once-per-launch gate only when the store was reachable:
-        // with Complete file protection the database is legitimately
-        // unavailable while the device is locked, and skipping recovery then
-        // would leave crashed 'sending' rows stuck forever after unlock.
-        if await outbox.recoverInterruptedSends() {
-            self.hasRecoveredInterruptedOutboxSends = true
-        }
+        guard let outbox else { return }
+        // The store owns the once-per-process gate so overlapping/replacement
+        // view models cannot reset another active sender's claim.
+        _ = await outbox.recoverInterruptedSends()
     }
 
     private func setOutboxState(_ state: OpenClawChatOutboxMessageState, forCommandID commandID: String) {
@@ -474,6 +482,8 @@ extension OpenClawChatViewModel {
             .queued
         case .sending:
             .sending
+        case .awaitingConfirmation:
+            .confirming
         case .failed:
             .failed(reason: command.lastError)
         }

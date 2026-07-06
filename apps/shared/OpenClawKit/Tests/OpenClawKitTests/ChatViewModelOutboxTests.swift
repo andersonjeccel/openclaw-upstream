@@ -10,6 +10,18 @@ private func makeOutboxDatabaseURL() throws -> URL {
     return dir.appendingPathComponent("chat-cache.sqlite", isDirectory: false)
 }
 
+private func outboxTestCommand(id: String, text: String, createdAt: Double) -> OpenClawChatOutboxCommand {
+    OpenClawChatOutboxCommand(
+        id: id,
+        sessionKey: "main",
+        text: text,
+        thinking: "off",
+        createdAt: createdAt,
+        status: .queued,
+        retryCount: 0,
+        lastError: nil)
+}
+
 private func userTexts(_ vm: OpenClawChatViewModel) async -> [String] {
     await MainActor.run {
         vm.messages
@@ -26,6 +38,7 @@ private actor OutboxTransportState {
     var healthy: Bool
     var sendFails: Bool
     var sendRejects = false
+    var sendResponseErrors = false
     var historyFails = false
     var heldSendGate: DeleteGate?
     var staleHistoryRows: [AnyCodable]?
@@ -61,6 +74,10 @@ private actor OutboxTransportState {
 
     func setSendRejects(_ rejects: Bool) {
         self.sendRejects = rejects
+    }
+
+    func setSendResponseErrors(_ rejects: Bool) {
+        self.sendResponseErrors = rejects
     }
 
     func recordSend(sessionKey: String, message: String, idempotencyKey: String, thinking: String) {
@@ -107,8 +124,11 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
         }
         let keys = await self.state.sentIdempotencyKeys
         let texts = await self.state.sentMessages
-        let durableUserRows = zip(keys.indices, keys).map { index, key in
-            AnyCodable([
+        let sessions = await self.state.sentSessionKeys
+        let durableUserRows = keys.indices.compactMap { index -> AnyCodable? in
+            guard index < sessions.count, sessions[index] == sessionKey else { return nil }
+            let key = keys[index]
+            return AnyCodable([
                 "role": "user",
                 "content": [["type": "text", "text": index < texts.count ? texts[index] : ""]],
                 "timestamp": Double(1000 + index),
@@ -137,6 +157,13 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
         }
         if await self.state.sendFails {
             throw OutboxSendError()
+        }
+        if await self.state.sendResponseErrors {
+            throw GatewayResponseError(
+                method: "chat.send",
+                code: "INVALID_REQUEST",
+                message: "rejected",
+                details: nil)
         }
         if await self.state.sendRejects {
             // Gateway responded but refused to start the run.
@@ -242,13 +269,16 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
         await self.base.recoverInterruptedSends()
     }
 
-    @discardableResult
-    func markCommandSending(id: String) async -> Bool {
-        await self.base.markCommandSending(id: id)
+    func claimNextCommand() async -> OpenClawChatOutboxCommand? {
+        await self.base.claimNextCommand()
     }
 
     func markCommandQueued(id: String, retryCount: Int, lastError: String?) async {
         await self.base.markCommandQueued(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.markCommandAwaitingConfirmation(id: id)
     }
 
     func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
@@ -344,6 +374,32 @@ struct ChatViewModelOutboxTests {
         #expect(cachedUserTexts == ["first", "second"])
     }
 
+    @Test func `overlapping view models share one atomic FIFO sender`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let now = Date().timeIntervalSince1970
+        #expect(await store.enqueueCommand(outboxTestCommand(id: "c-1", text: "first", createdAt: now)))
+        #expect(await store.enqueueCommand(outboxTestCommand(id: "c-2", text: "second", createdAt: now + 1)))
+        let transport = OutboxTestTransport(healthy: false)
+        let firstVM = await makeOutboxViewModel(transport: transport, outbox: store)
+        let secondVM = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await transport.state.setHealthy(true)
+        await MainActor.run {
+            firstVM.load()
+            secondVM.load()
+            firstVM.applyTransportHealth(true)
+            secondVM.applyTransportHealth(true)
+        }
+
+        try await waitUntil("shared queue drained") {
+            await store.loadCommands().isEmpty
+        }
+        #expect(await transport.state.sentIdempotencyKeys == ["c-1", "c-2"])
+        #expect(await transport.state.sentMessages == ["first", "second"])
+    }
+
     @Test func `assistant reply for a flushed run lands via the external-run final event`() async throws {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -389,7 +445,7 @@ struct ChatViewModelOutboxTests {
         }
     }
 
-    @Test func `sent turn is cached before the outbox row is deleted`() async throws {
+    @Test func `acknowledged turn stays durable until history confirms it`() async throws {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
@@ -399,18 +455,25 @@ struct ChatViewModelOutboxTests {
         await MainActor.run { vm.load() }
         try await sendWhileOffline(vm, text: "must survive")
 
-        // Sends succeed on reconnect but history stays unreachable, so the
-        // post-flush history write-through can never populate the cache.
-        // Only the pre-delete write-through can preserve the turn.
+        // chat.send ACKs before user-turn persistence. With history still
+        // unreachable, the row must remain durable and non-replayable.
         await transport.state.setHistoryFails(true)
         await transport.goOnline()
-        try await waitUntil("outbox drained") {
-            await store.loadCommands().isEmpty
+        try await waitUntil("acknowledgement awaits history") {
+            await store.loadCommands().map(\.status) == [.awaitingConfirmation]
         }
 
         let cached = await store.loadTranscript(sessionKey: "main")
         #expect(cached.map { $0.content.compactMap(\.text).joined() } == ["must survive"])
-        _ = vm
+        #expect(await MainActor.run {
+            vm.messages.contains { vm.outboxState(for: $0.id) == .confirming }
+        })
+
+        await transport.state.setHistoryFails(false)
+        await MainActor.run { vm.refresh() }
+        try await waitUntil("canonical history confirms send") {
+            await store.loadCommands().isEmpty
+        }
     }
 
     @Test func `gateway rejections burn attempts then fail terminally and support tap retry`() async throws {
@@ -450,6 +513,50 @@ struct ChatViewModelOutboxTests {
             await store.loadCommands().isEmpty
         }
         #expect(await transport.state.sentIdempotencyKeys.count == 1)
+    }
+
+    @Test func `gateway response errors are definitive and burn retry attempts`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "definitively rejected")
+        await transport.state.setSendResponseErrors(true)
+        await transport.goOnline()
+
+        try await waitUntil("response error exhausts retry budget") {
+            await store.loadCommands().map(\.status) == [.failed]
+        }
+        let failed = try #require(await store.loadCommands().first)
+        #expect(failed.retryCount == OpenClawChatViewModel.maxOutboxSendAttempts)
+        #expect(await transport.state.sentIdempotencyKeys.isEmpty)
+    }
+
+    @Test func `definitive live-send rejection restores draft without queueing`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: true)
+        await transport.state.setSendResponseErrors(true)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { vm.load() }
+        try await waitUntil("bootstrap healthy") {
+            await MainActor.run { vm.healthOK }
+        }
+        await MainActor.run {
+            vm.input = "keep this draft"
+            vm.send()
+        }
+        try await waitUntil("definitive rejection surfaced") {
+            await MainActor.run { vm.errorText != nil }
+        }
+        #expect(await MainActor.run { vm.input } == "keep this draft")
+        #expect(await userTexts(vm).isEmpty)
+        #expect(await store.loadCommands().isEmpty)
     }
 
     @Test func `transport failures keep commands queued without burning attempts`() async throws {
@@ -577,12 +684,15 @@ struct ChatViewModelOutboxTests {
 
         await MainActor.run { vm.load() }
         await transport.goOnline()
-        try await waitUntil("outbox drained") {
-            await store.loadCommands().isEmpty
+        try await waitUntil("background send awaits its history") {
+            await store.loadCommands().map(\.status) == [.awaitingConfirmation]
         }
         #expect(await transport.state.sentThinkingLevels == ["high"])
         #expect(await transport.state.sentSessionKeys == ["other-session"])
-        _ = vm
+        await MainActor.run { vm.switchSession(to: "other-session") }
+        try await waitUntil("background send confirmed") {
+            await store.loadCommands().isEmpty
+        }
     }
 
     @Test func `flushed background-session turn is spliced into its cached transcript`() async throws {
@@ -605,8 +715,8 @@ struct ChatViewModelOutboxTests {
 
         await MainActor.run { vm.load() }
         await transport.goOnline()
-        try await waitUntil("outbox drained") {
-            await store.loadCommands().isEmpty
+        try await waitUntil("background send awaits its history") {
+            await store.loadCommands().map(\.status) == [.awaitingConfirmation]
         }
 
         // The turn survives in that session's cached transcript even though
@@ -614,7 +724,10 @@ struct ChatViewModelOutboxTests {
         let cached = await store.loadTranscript(sessionKey: "other-session")
         #expect(cached.map { $0.content.compactMap(\.text).joined() } == ["sent from elsewhere"])
         #expect(cached.map(\.idempotencyKey) == ["c-background:user"])
-        _ = vm
+        await MainActor.run { vm.switchSession(to: "other-session") }
+        try await waitUntil("background send confirmed") {
+            await store.loadCommands().isEmpty
+        }
     }
 
     @Test func `full queue refuses enqueue and keeps the draft`() async throws {
@@ -751,17 +864,20 @@ private final class HeldDeleteOutbox: @unchecked Sendable, OpenClawChatCommandOu
         await self.base.recoverInterruptedSends()
     }
 
-    @discardableResult
-    func markCommandSending(id: String) async -> Bool {
+    func claimNextCommand() async -> OpenClawChatOutboxCommand? {
         if let hook = self.onClaim {
             self.onClaim = nil
             await hook()
         }
-        return await self.base.markCommandSending(id: id)
+        return await self.base.claimNextCommand()
     }
 
     func markCommandQueued(id: String, retryCount: Int, lastError: String?) async {
         await self.base.markCommandQueued(id: id, retryCount: retryCount, lastError: lastError)
+    }
+
+    func markCommandAwaitingConfirmation(id: String) async -> OpenClawChatOutboxUpdateResult {
+        await self.base.markCommandAwaitingConfirmation(id: id)
     }
 
     func markCommandFailed(id: String, retryCount: Int, lastError: String?) async {
@@ -843,8 +959,8 @@ extension ChatViewModelOutboxTests {
         ] as [String: Any])
         await transport.state.setStaleHistoryRows([staleRow])
         await transport.goOnline()
-        try await waitUntil("outbox drained") {
-            await store.loadCommands().isEmpty
+        try await waitUntil("acknowledgement awaits canonical history") {
+            await store.loadCommands().map(\.status) == [.awaitingConfirmation]
         }
         try await waitUntil("stale refresh applied") {
             await MainActor.run { vm.messages.contains { message in
@@ -852,8 +968,8 @@ extension ChatViewModelOutboxTests {
             } }
         }
         // Wait out the chained cache writes, then cold-reopen offline: the
-        // sent turn must still pre-paint even though the outbox row is gone
-        // and the last history snapshot did not contain it.
+        // sent turn must still pre-paint while the durable confirmation row
+        // protects it from the lagging snapshot.
         if let pendingWrite = await MainActor.run(body: { vm.pendingCacheWriteTask }) {
             await pendingWrite.value
         }
@@ -861,6 +977,11 @@ extension ChatViewModelOutboxTests {
         #expect(cached.contains { message in
             message.content.contains { $0.text == "must survive stale history" }
         })
+        await transport.state.setStaleHistoryRows(nil)
+        await MainActor.run { vm.refresh() }
+        try await waitUntil("fresh history confirms send") {
+            await store.loadCommands().isEmpty
+        }
     }
 
     @Test func `send before restore adopts durable rows still queues behind them`() async throws {
@@ -1031,9 +1152,8 @@ extension ChatViewModelOutboxTests {
             vm.messages.first { vm.outboxState(for: $0.id) == .queued }?.id
         })
 
-        // The delete lands inside markCommandSending's await window: after
-        // the pre-claim tombstone check, before the claim resolves. The
-        // post-claim recheck must catch it.
+        // The delete lands inside claimNextCommand's await window. The
+        // post-claim tombstone check must catch it.
         outbox.setOnClaim {
             await MainActor.run { vm.deleteOutboxMessage(messageID) }
         }
@@ -1072,18 +1192,20 @@ extension ChatViewModelOutboxTests {
         await MainActor.run { vm.deleteOutboxMessage(messageID) }
 
         await transport.goOnline()
-        try await waitUntil("flush pass drains without sending") {
-            await MainActor.run { queuedStateCount(vm) == 0 }
-        }
+        try await Task.sleep(nanoseconds: 100_000_000)
         #expect(await transport.state.sentIdempotencyKeys.isEmpty)
 
-        // Once the held deletion completes, the row is gone for good and a
-        // later flush still sends nothing.
+        // The bubble remains until durable deletion completes. Once released,
+        // the row is gone for good and a later flush still sends nothing.
+        #expect(await MainActor.run { queuedStateCount(vm) } == 1)
         await outbox.releaseHeldDeletes()
         try await waitUntil("durable row deleted") {
             await store.loadCommands().isEmpty
         }
-        await transport.emit(.health(ok: true))
+        try await waitUntil("outbox state cleared") {
+            await MainActor.run { queuedStateCount(vm) == 0 }
+        }
+        transport.emit(.health(ok: true))
         #expect(await transport.state.sentIdempotencyKeys.isEmpty)
     }
 }

@@ -78,8 +78,6 @@ public final class OpenClawChatViewModel {
     var isFlushingOutbox = false
     @ObservationIgnored
     var isOutboxFlushRequestedWhileActive = false
-    @ObservationIgnored
-    var hasRecoveredInterruptedOutboxSends = false
     /// Tombstones set synchronously on user delete so an active flush pass
     /// never sends a command whose bubble the user just removed.
     @ObservationIgnored
@@ -93,15 +91,6 @@ public final class OpenClawChatViewModel {
     /// the reconnect machinery owns pacing.
     @ObservationIgnored
     var outboxTransportFailureStreak = 0
-    /// User idempotency keys of turns just flushed from the outbox whose
-    /// durable outbox row is already deleted but which no history snapshot
-    /// has confirmed yet. Reconciliation must not evict them: the gateway
-    /// history can lag the ack, and eviction here would drop the turn from
-    /// both the screen and the write-through cache. Drained when a snapshot
-    /// contains the key; bounded because every flush drains or session
-    /// switches clear it.
-    @ObservationIgnored
-    var recentlySentOutboxUserKeys: Set<String> = []
     /// False until restoreOutboxMessages has adopted durable rows for the
     /// visible session. Until then the in-memory outbox state is blind to
     /// rows persisted by an earlier process, so the FIFO send gate must
@@ -255,9 +244,9 @@ public final class OpenClawChatViewModel {
         self.modelPickerStore = modelPickerStore
         self.modelPickerFavorites = modelPickerStore.favorites
         self.modelPickerRecents = modelPickerStore.recents
+        self.outbox = outbox
         let normalizedAgentId = activeAgentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         self.activeAgentId = normalizedAgentId?.isEmpty == false ? normalizedAgentId : nil
-        self.outbox = outbox
         let normalizedThinkingLevel = Self.normalizedThinkingLevel(initialThinkingLevel)
         let initialResolvedThinkingLevel = normalizedThinkingLevel ?? "off"
         self.thinkingLevel = initialResolvedThinkingLevel
@@ -557,6 +546,10 @@ public final class OpenClawChatViewModel {
                 }
             }
         }
+        // Durable outbox rows remain authoritative until canonical history
+        // confirms their idempotency key. Keep their bubbles through lagging
+        // snapshots, including across app relaunches and session switches.
+        retainedMessageIDs.formUnion(self.outboxCommandIDsByMessageID.keys)
         var nextMessages = if preservingOptimisticLocalMessages {
             Self.reconcileRunRefreshMessages(
                 previous: self.messages,
@@ -565,24 +558,13 @@ public final class OpenClawChatViewModel {
         } else {
             Self.reconcileMessageIDs(previous: self.messages, incoming: incoming)
         }
-        // Ack-to-history window: turns just flushed from the outbox may not
-        // be in this snapshot yet. Their durable rows are gone, so keep the
-        // visible rows (appended: they are the newest turns) until a
-        // snapshot carries their idempotency key.
-        if !self.recentlySentOutboxUserKeys.isEmpty {
-            self.recentlySentOutboxUserKeys.subtract(incoming.compactMap(\.idempotencyKey))
-            let nextKeys = Set(nextMessages.compactMap(\.idempotencyKey))
-            let preserved = self.messages.filter { message in
-                guard let key = message.idempotencyKey else { return false }
-                return self.recentlySentOutboxUserKeys.contains(key) && !nextKeys.contains(key)
-            }
-            nextMessages.append(contentsOf: preserved)
-        }
         let reconciledMessageIDs = Set(nextMessages.map(\.id))
         nextMessages.append(contentsOf: self.messages.filter { message in
             retainedMessageIDs.contains(message.id) && !reconciledMessageIDs.contains(message.id)
         })
-        self.replaceMessages(Self.dedupeMessages(nextMessages))
+        nextMessages = Self.dedupeMessages(nextMessages)
+        self.replaceMessages(nextMessages)
+        self.confirmOutboxCommands(in: incoming, session: request.session)
         self.prunePendingLocalUserEchoMessageIDs()
         self.clearProvisionalFinalMarkersAdoptedByHistory(incoming)
         self.pruneProvisionalFinalMessages()
@@ -616,10 +598,8 @@ public final class OpenClawChatViewModel {
         // An empty post-send refresh is incomplete by contract: reconciliation
         // preserves the visible transcript, so preserve its last canonical cache too.
         if !preservingOptimisticLocalMessages || !incoming.isEmpty {
-            // Persist the RECONCILED transcript, not raw incoming: a stale
-            // snapshot missing a just-acked turn must not overwrite the
-            // cache after the durable outbox row is already gone — the cache
-            // mirrors what the user sees.
+            // Persist the reconciled transcript, including durable outbox
+            // rows retained while canonical history catches up.
             self.persistTranscriptToCache(sessionKey: request.session.key, messages: nextMessages)
         }
         // Wholesale history replacement drops local-only queued bubbles;
@@ -1231,7 +1211,7 @@ public final class OpenClawChatViewModel {
             // gate. Requeue text-only sends durably (same runId = same
             // idempotency identity, safe even if the send actually landed)
             // and keep the optimistic bubble as the queued row.
-            if encodedAttachments.isEmpty {
+            if encodedAttachments.isEmpty, !(error is GatewayResponseError) {
                 self.runMessageScopesByRunID.removeValue(forKey: runId)
                 self.clearPendingRun(runId)
                 let requeued = await self.requeueFailedLiveSend(
@@ -1252,6 +1232,9 @@ public final class OpenClawChatViewModel {
                 if self.input.isEmpty {
                     self.input = messageText
                 }
+            }
+            if encodedAttachments.isEmpty, self.input.isEmpty {
+                self.input = messageText
             }
             self.removePendingLocalUserEcho(for: runId)
             self.runMessageScopesByRunID.removeValue(forKey: runId)
@@ -1358,7 +1341,6 @@ public final class OpenClawChatViewModel {
         self.pendingLocalUserEchoMessageIDsByRunID.removeAll()
         self.runMessageScopesByRunID.removeAll()
         self.provisionalFinalMessagesByID.removeAll()
-        self.recentlySentOutboxUserKeys.removeAll()
         self.resetOutboxPresentationForSessionSwitch()
         self.sessionId = nil
         self.pendingToolCallsById = [:]
@@ -1812,6 +1794,7 @@ public final class OpenClawChatViewModel {
 
         let sanitized = Self.stripInboundMetadata(from: message)
         self.invalidateHistorySnapshots()
+        self.confirmOutboxCommands(in: [sanitized], session: self.currentSessionSnapshot())
         // The active client also receives the gateway's echo of the user turn it
         // just sent. performSend already appended an optimistic row carrying a
         // local client timestamp, while the echo carries a server timestamp, so

@@ -420,10 +420,9 @@ public struct OpenClawChatView: View {
                         }
                     }
                 }
-                // No Delete while `.sending`: the transport call is already
-                // in flight and cannot be prevented, so removing the bubble
-                // would hide a message that may still reach the gateway.
-                if outboxState != .sending {
+                // Sending and acknowledged-but-unconfirmed rows may still
+                // reach canonical history, so deletion would hide real work.
+                if !outboxState.preventsDeletion {
                     Button(role: .destructive) {
                         self.viewModel.deleteOutboxMessage(msg.id)
                     } label: {
