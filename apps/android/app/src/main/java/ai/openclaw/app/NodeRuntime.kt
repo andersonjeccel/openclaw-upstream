@@ -6,6 +6,10 @@ import ai.openclaw.app.chat.ChatCommandEntry
 import ai.openclaw.app.chat.ChatCommandOutbox
 import ai.openclaw.app.chat.ChatController
 import ai.openclaw.app.chat.ChatMessage
+import ai.openclaw.app.chat.MessageSpeechClient
+import ai.openclaw.app.chat.MessageSpeechController
+import ai.openclaw.app.chat.MessageSpeechState
+import ai.openclaw.app.chat.SystemSpeechSpeaker
 import ai.openclaw.app.chat.ChatOutboxItem
 import ai.openclaw.app.chat.ChatPendingToolCall
 import ai.openclaw.app.chat.ChatSessionEntry
@@ -59,6 +63,7 @@ import ai.openclaw.app.node.invokeErrorFromThrowable
 import ai.openclaw.app.node.parseHexColorArgb
 import ai.openclaw.app.protocol.OpenClawCanvasA2UIAction
 import ai.openclaw.app.voice.MicCaptureManager
+import ai.openclaw.app.voice.TalkAudioPlayer
 import ai.openclaw.app.voice.TalkModeManager
 import ai.openclaw.app.voice.TalkPttOnceStart
 import ai.openclaw.app.voice.TalkPttStopPayload
@@ -2652,7 +2657,34 @@ class NodeRuntime private constructor(
   }
 
   fun switchChatSession(sessionKey: String) {
+    stopMessageSpeech()
     chat.switchSession(sessionKey)
+  }
+
+  private val messageSpeechLazy: Lazy<MessageSpeechController> =
+    lazy {
+      MessageSpeechController(
+        scope = scope,
+        synthesizer = MessageSpeechClient(session = operatorSession),
+        player = TalkAudioPlayer(context = appContext),
+        localSpeech = SystemSpeechSpeaker(context = appContext),
+      )
+    }
+
+  val messageSpeechState: StateFlow<MessageSpeechState?>
+    get() = messageSpeechLazy.value.state
+
+  fun toggleMessageSpeech(
+    messageId: String,
+    text: String,
+  ) {
+    messageSpeechLazy.value.toggle(messageId = messageId, text = text)
+  }
+
+  fun stopMessageSpeech() {
+    if (messageSpeechLazy.isInitialized()) {
+      messageSpeechLazy.value.stop()
+    }
   }
 
   fun abortChat() {

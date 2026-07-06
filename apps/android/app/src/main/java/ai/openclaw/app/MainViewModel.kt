@@ -5,6 +5,7 @@ import ai.openclaw.app.chat.ChatMessage
 import ai.openclaw.app.chat.ChatOutboxItem
 import ai.openclaw.app.chat.ChatPendingToolCall
 import ai.openclaw.app.chat.ChatSessionEntry
+import ai.openclaw.app.chat.MessageSpeechState
 import ai.openclaw.app.chat.OutgoingAttachment
 import ai.openclaw.app.gateway.GatewayEndpoint
 import ai.openclaw.app.gateway.GatewayUpdateAvailableSummary
@@ -619,6 +620,20 @@ class MainViewModel(
 
   fun setChatThinkingLevel(level: String) {
     ensureRuntime().setChatThinkingLevel(level)
+  }
+
+  val chatMessageSpeech: StateFlow<MessageSpeechState?> =
+    runtimeState(initial = null) { it.messageSpeechState }
+
+  fun toggleChatMessageSpeech(
+    messageId: String,
+    text: String,
+  ) {
+    ensureRuntime().toggleMessageSpeech(messageId = messageId, text = text)
+  }
+
+  fun stopChatMessageSpeech() {
+    runtimeRef.value?.stopMessageSpeech()
   }
 
   fun switchChatSession(sessionKey: String) {

@@ -7,7 +7,9 @@ import ai.openclaw.app.chat.ChatMessageContent
 import ai.openclaw.app.chat.ChatOutboxItem
 import ai.openclaw.app.chat.ChatPendingToolCall
 import ai.openclaw.app.chat.ChatSessionEntry
+import ai.openclaw.app.chat.MessageSpeechState
 import ai.openclaw.app.chat.OutgoingAttachment
+import ai.openclaw.app.chat.chatMessageSpeechText
 import ai.openclaw.app.ui.copyGatewayDiagnosticsReport
 import ai.openclaw.app.ui.design.ClawListItem
 import ai.openclaw.app.ui.design.ClawLoadingState
@@ -23,7 +25,9 @@ import ai.openclaw.app.ui.gatewayStatusForDisplay
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -46,8 +50,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.HourglassEmpty
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Cloud
@@ -55,11 +62,14 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -113,6 +123,7 @@ fun ChatScreen(
   val assistantAutoSendInFlight by viewModel.assistantAutoSendInFlight.collectAsState()
   val remoteAddress by viewModel.remoteAddress.collectAsState()
   val outboxItems by viewModel.chatOutboxItems.collectAsState()
+  val messageSpeechState by viewModel.chatMessageSpeech.collectAsState()
   val manualHost by viewModel.manualHost.collectAsState()
   val manualPort by viewModel.manualPort.collectAsState()
   val manualTls by viewModel.manualTls.collectAsState()
@@ -246,8 +257,14 @@ fun ChatScreen(
       onRetryOutbox = viewModel::retryChatOutboxCommand,
       onDeleteOutbox = viewModel::deleteChatOutboxCommand,
       onStarterPrompt = { prompt -> input = prompt },
+      speechState = messageSpeechState,
+      onToggleListen = viewModel::toggleChatMessageSpeech,
       modifier = Modifier.weight(1f),
     )
+
+    DisposableEffect(Unit) {
+      onDispose { viewModel.stopChatMessageSpeech() }
+    }
 
     ChatComposer(
       value = input,
@@ -523,6 +540,8 @@ private fun ChatMessageList(
   onRetryOutbox: (String) -> Unit,
   onDeleteOutbox: (String) -> Unit,
   onStarterPrompt: (String) -> Unit,
+  speechState: MessageSpeechState?,
+  onToggleListen: (String, String) -> Unit,
   modifier: Modifier = Modifier,
 ) {
   val timeline =
@@ -552,13 +571,23 @@ private fun ChatMessageList(
     ) {
       itemsIndexed(items = timeline.items, key = { _, item -> chatTimelineItemKey(item) }) { _, item ->
         when (item) {
-          is ChatTimelineItem.Message ->
+          is ChatTimelineItem.Message -> {
+            val message = item.message
+            val isAssistant = message.role.trim().lowercase(Locale.US) == "assistant"
             ChatBubble(
-              role = item.message.role,
+              role = message.role,
               live = false,
-              content = item.message.content,
-              timestampMs = item.message.timestampMs,
+              content = message.content,
+              timestampMs = message.timestampMs,
+              speech = speechState?.takeIf { it.messageId == message.id },
+              onToggleListen =
+                if (isAssistant) {
+                  { onToggleListen(message.id, chatMessageSpeechText(message.content)) }
+                } else {
+                  null
+                },
             )
+          }
           is ChatTimelineItem.OutboxCommand ->
             ChatOutboxBubble(
               item = item.item,
@@ -720,12 +749,15 @@ private val starterPrompts =
     StarterPrompt(mark = "3", title = "Use this phone", subtitle = "Ask OpenClaw to use Android capabilities.", message = "What can you help me do from this phone right now?"),
   )
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ChatBubble(
   role: String,
   live: Boolean,
   content: List<ChatMessageContent>,
   timestampMs: Long?,
+  speech: MessageSpeechState? = null,
+  onToggleListen: (() -> Unit)? = null,
 ) {
   val normalizedRole = role.trim().lowercase(Locale.US)
   val isUser = normalizedRole == "user"
@@ -738,13 +770,28 @@ private fun ChatBubble(
       }
     }
   if (displayableContent.isEmpty()) return
+  var listenMenuExpanded by remember { mutableStateOf(false) }
+  val hasSpokenText = content.any { it.type == "text" && !it.text.isNullOrBlank() }
+  val listenGesture =
+    if (onToggleListen != null && hasSpokenText) {
+      // Tap stops an active playback; long-press opens the Listen menu.
+      Modifier.combinedClickable(
+        onClick = { if (speech != null) onToggleListen() },
+        onLongClick = { listenMenuExpanded = true },
+      )
+    } else {
+      Modifier
+    }
 
   Row(
     modifier = Modifier.fillMaxWidth(),
     horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
   ) {
     Surface(
-      modifier = Modifier.fillMaxWidth(if (isUser) 0.84f else 0.94f),
+      modifier =
+        Modifier
+          .fillMaxWidth(if (isUser) 0.84f else 0.94f)
+          .then(listenGesture),
       shape = RoundedCornerShape(7.dp),
       color = if (isUser) ClawTheme.colors.surfacePressed.copy(alpha = 0.86f) else ClawTheme.colors.surfaceRaised.copy(alpha = 0.84f),
       contentColor = ClawTheme.colors.text,
@@ -753,6 +800,24 @@ private fun ChatBubble(
       shadowElevation = 2.dp,
     ) {
       Column(modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (onToggleListen != null) {
+          DropdownMenu(expanded = listenMenuExpanded, onDismissRequest = { listenMenuExpanded = false }) {
+            DropdownMenuItem(
+              text = { Text(text = if (speech != null) "Stop listening" else "Listen", style = ClawTheme.type.body) },
+              leadingIcon = {
+                Icon(
+                  imageVector = if (speech != null) Icons.Default.Stop else Icons.AutoMirrored.Filled.VolumeUp,
+                  contentDescription = null,
+                  modifier = Modifier.size(18.dp),
+                )
+              },
+              onClick = {
+                listenMenuExpanded = false
+                onToggleListen()
+              },
+            )
+          }
+        }
         Text(
           text =
             when {
@@ -769,6 +834,24 @@ private fun ChatBubble(
             ChatText(text = part.text.orEmpty(), textColor = ClawTheme.colors.text, isStreaming = live)
           } else {
             Text(text = part.fileName ?: "Attachment", style = ClawTheme.type.body, color = ClawTheme.colors.textMuted)
+          }
+        }
+        speech?.let { state ->
+          Row(
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Icon(
+              imageVector = if (state.preparing) Icons.Default.HourglassEmpty else Icons.AutoMirrored.Filled.VolumeUp,
+              contentDescription = null,
+              modifier = Modifier.size(14.dp),
+              tint = ClawTheme.colors.textMuted,
+            )
+            Text(
+              text = if (state.preparing) "Preparing audio…" else "Speaking…",
+              style = ClawTheme.type.caption,
+              color = ClawTheme.colors.textMuted,
+            )
           }
         }
         timestampMs?.let {
