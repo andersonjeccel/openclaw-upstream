@@ -68,6 +68,7 @@ public actor GatewayNodeSession {
     private var hasEverConnected = false
     private var hasNotifiedConnected = false
     private var snapshotReceived = false
+    private var serverCapabilities: Set<GatewayServerCapability>?
     private var snapshotWaiters: [CheckedContinuation<Bool, Never>] = []
 
     static func invokeWithTimeout(
@@ -262,7 +263,7 @@ public actor GatewayNodeSession {
             channelGeneration = self.channelGeneration
         }
 
-        guard let channel = self.channel else {
+        guard let channel else {
             throw NSError(domain: "Gateway", code: 0, userInfo: [
                 NSLocalizedDescriptionKey: "gateway channel unavailable",
             ])
@@ -309,7 +310,7 @@ public actor GatewayNodeSession {
 
     @discardableResult
     public func refreshPluginSurfaceUrl(surface: String, timeoutSeconds: Int = 8) async -> String? {
-        guard let channel = self.channel else { return nil }
+        guard let channel else { return nil }
         let trimmedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedSurface.isEmpty else { return nil }
 
@@ -327,7 +328,7 @@ public actor GatewayNodeSession {
     }
 
     public func currentRemoteAddress() -> String? {
-        guard let url = self.activeURL else { return nil }
+        guard let url = activeURL else { return nil }
         guard let host = url.host else { return url.absoluteString }
         let port = url.port ?? (url.scheme == "wss" ? 443 : 80)
         if host.contains(":") {
@@ -347,6 +348,17 @@ public actor GatewayNodeSession {
         return GatewayNodeSessionRoute(channelGeneration: self.channelGeneration)
     }
 
+    public func supportsServerCapability(
+        _ capability: GatewayServerCapability,
+        ifCurrentRoute expectedRoute: GatewayNodeSessionRoute) -> Bool?
+    {
+        guard expectedRoute.channelGeneration == self.channelGeneration,
+              self.channel != nil,
+              let serverCapabilities
+        else { return nil }
+        return serverCapabilities.contains(capability)
+    }
+
     @discardableResult
     public func sendEvent(
         event: String,
@@ -356,7 +368,7 @@ public actor GatewayNodeSession {
         if let expectedRoute, expectedRoute.channelGeneration != self.channelGeneration {
             return false
         }
-        guard let channel = self.channel else { return false }
+        guard let channel else { return false }
         let params: [String: AnyCodable] = [
             "event": AnyCodable(event),
             "payloadJSON": AnyCodable(payloadJSON ?? NSNull()),
@@ -371,13 +383,13 @@ public actor GatewayNodeSession {
     }
 
     public func send(method: String, paramsJSON: String?) async throws {
-        guard let channel = self.channel else {
+        guard let channel else {
             throw NSError(domain: "Gateway", code: 11, userInfo: [
                 NSLocalizedDescriptionKey: "not connected",
             ])
         }
 
-        let params = try self.decodeParamsJSON(paramsJSON)
+        let params = try decodeParamsJSON(paramsJSON)
         try await channel.send(method: method, params: params)
     }
 
@@ -390,13 +402,13 @@ public actor GatewayNodeSession {
         if let expectedRoute, expectedRoute.channelGeneration != self.channelGeneration {
             throw CancellationError()
         }
-        guard let channel = self.channel else {
+        guard let channel else {
             throw NSError(domain: "Gateway", code: 11, userInfo: [
                 NSLocalizedDescriptionKey: "not connected",
             ])
         }
 
-        let params = try self.decodeParamsJSON(paramsJSON)
+        let params = try decodeParamsJSON(paramsJSON)
         return try await channel.request(
             method: method,
             params: params,
@@ -419,6 +431,8 @@ public actor GatewayNodeSession {
         switch push {
         case let .snapshot(ok):
             self.pluginSurfaceUrls = self.normalizePluginSurfaceUrls(ok.pluginsurfaceurls)
+            self.serverCapabilities = Set(
+                GatewayServerCapability.allCases.filter { ok.supportsServerCapability($0) })
             if self.hasEverConnected {
                 self.broadcastServerEvent(
                     EventFrame(type: "event", event: "seqGap", payload: nil, seq: nil, stateversion: nil))
@@ -427,7 +441,7 @@ public actor GatewayNodeSession {
             self.markSnapshotReceived()
             await self.notifyConnectedIfNeeded()
         case let .event(evt):
-            guard let channel = self.channel else { return }
+            guard let channel else { return }
             await self.handleEvent(
                 evt,
                 channel: channel,
@@ -440,6 +454,7 @@ public actor GatewayNodeSession {
     private func resetConnectionState() {
         self.hasNotifiedConnected = false
         self.snapshotReceived = false
+        self.serverCapabilities = nil
         self.drainSnapshotWaiters(returning: false)
     }
 
@@ -516,7 +531,7 @@ public actor GatewayNodeSession {
                 method: method,
                 params: params,
                 timeoutMs: Double(timeoutSeconds * 1000))
-            let decoded = try self.decoder.decode(PluginSurfaceRefreshResponse.self, from: data)
+            let decoded = try decoder.decode(PluginSurfaceRefreshResponse.self, from: data)
             let urls = self.normalizePluginSurfaceUrls(decoded.pluginSurfaceUrls)
             guard let refreshed = urls[surface] else { return nil }
             self.pluginSurfaceUrls[surface] = refreshed
@@ -537,7 +552,7 @@ public actor GatewayNodeSession {
         self.logger.info("node invoke request received")
         guard let payload = evt.payload else { return }
         do {
-            let request = try self.decodeInvokeRequest(from: payload)
+            let request = try decodeInvokeRequest(from: payload)
             let timeoutLabel = request.timeoutMs.map(String.init) ?? "none"
             self.logger.info(
                 "node invoke request decoded id=\(request.id, privacy: .public) command=\(request.command, privacy: .public) timeoutMs=\(timeoutLabel, privacy: .public)")
@@ -588,7 +603,7 @@ public actor GatewayNodeSession {
 
     private func decodeInvokeRequest(from payload: OpenClawProtocol.AnyCodable) throws -> NodeInvokeRequestPayload {
         do {
-            let data = try self.encoder.encode(payload)
+            let data = try encoder.encode(payload)
             return try self.decoder.decode(NodeInvokeRequestPayload.self, from: data)
         } catch {
             if let raw = payload.value as? String, let data = raw.data(using: .utf8) {

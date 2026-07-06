@@ -14,6 +14,7 @@ private func outboxTestCommand(id: String, text: String, createdAt: Double) -> O
     OpenClawChatOutboxCommand(
         id: id,
         sessionKey: "main",
+        routingContract: "per-sender|main|main",
         text: text,
         thinking: "off",
         createdAt: createdAt,
@@ -37,18 +38,37 @@ private struct OutboxSendError: Error, LocalizedError {
 }
 
 private actor OutboxTransportState {
+    var sessionRoutingContract = "per-sender|main|main"
     var healthy: Bool
     var routeGeneration = 0
     var sendFails: Bool
     var sendRejects = false
     var sendResponseErrors = false
+    var sendRoutingChanged = false
     var historyFails = false
     var historyRequestCount = 0
     var heldSendGate: DeleteGate?
+    var commandListGate: DeleteGate?
+    let commandListStarted = DeleteGate()
     var staleHistoryRows: [AnyCodable]?
 
     func setHeldSendGate(_ gate: DeleteGate?) {
         self.heldSendGate = gate
+    }
+
+    func setCommandListGate(_ gate: DeleteGate?) {
+        self.commandListGate = gate
+    }
+
+    func waitUntilCommandListStarted() async {
+        await self.commandListStarted.wait()
+    }
+
+    func awaitCommandListGate() async {
+        await self.commandListStarted.open()
+        if let commandListGate {
+            await commandListGate.wait()
+        }
     }
 
     func setStaleHistoryRows(_ rows: [AnyCodable]?) {
@@ -58,6 +78,8 @@ private actor OutboxTransportState {
     var sentIdempotencyKeys: [String] = []
     var sentMessages: [String] = []
     var sentSessionKeys: [String] = []
+    var sentAgentIDs: [String?] = []
+    var historyRequestAgentIDs: [String?] = []
     var sentThinkingLevels: [String] = []
 
     init(healthy: Bool, sendFails: Bool) {
@@ -69,12 +91,17 @@ private actor OutboxTransportState {
         self.historyFails = fails
     }
 
-    func recordHistoryRequest() {
+    func recordHistoryRequest(agentID: String?) {
         self.historyRequestCount += 1
+        self.historyRequestAgentIDs.append(agentID)
     }
 
     func setHealthy(_ healthy: Bool) {
         self.healthy = healthy
+    }
+
+    func setSessionRoutingContract(_ contract: String) {
+        self.sessionRoutingContract = contract
     }
 
     func replaceRoute() {
@@ -93,8 +120,19 @@ private actor OutboxTransportState {
         self.sendResponseErrors = rejects
     }
 
-    func recordSend(sessionKey: String, message: String, idempotencyKey: String, thinking: String) {
+    func setSendRoutingChanged(_ changed: Bool) {
+        self.sendRoutingChanged = changed
+    }
+
+    func recordSend(
+        sessionKey: String,
+        agentID: String?,
+        message: String,
+        idempotencyKey: String,
+        thinking: String)
+    {
         self.sentSessionKeys.append(sessionKey)
+        self.sentAgentIDs.append(agentID)
         self.sentMessages.append(message)
         self.sentIdempotencyKeys.append(idempotencyKey)
         self.sentThinkingLevels.append(thinking)
@@ -106,11 +144,23 @@ private actor OutboxTransportState {
 /// every accepted send (what the gateway would persist).
 private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransport {
     let state: OutboxTransportState
+    private let supportsSlashCommands: Bool
+    private let requiresRoutingContract: Bool
+    private let routeUnavailableReason: String?
     private let stream: AsyncStream<OpenClawChatTransportEvent>
     private let continuation: AsyncStream<OpenClawChatTransportEvent>.Continuation
 
-    init(healthy: Bool, sendFails: Bool = false) {
+    init(
+        healthy: Bool,
+        sendFails: Bool = false,
+        supportsSlashCommands: Bool = false,
+        requiresRoutingContract: Bool = true,
+        routeUnavailableReason: String? = nil)
+    {
         self.state = OutboxTransportState(healthy: healthy, sendFails: sendFails)
+        self.supportsSlashCommands = supportsSlashCommands
+        self.requiresRoutingContract = requiresRoutingContract
+        self.routeUnavailableReason = routeUnavailableReason
         var cont: AsyncStream<OpenClawChatTransportEvent>.Continuation!
         self.stream = AsyncStream { c in cont = c }
         self.continuation = cont
@@ -126,19 +176,33 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
     }
 
     func requestHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload {
-        try await self.requestHistory(sessionKey: sessionKey, expectedRoute: nil)
+        try await self.requestHistory(sessionKey: sessionKey, agentID: nil, expectedRoute: nil)
+    }
+
+    var supportsSlashCommandCatalog: Bool {
+        self.supportsSlashCommands
+    }
+
+    var outboxRequiresSessionRoutingContract: Bool {
+        self.requiresRoutingContract
+    }
+
+    func listCommands(sessionKey _: String) async throws -> [OpenClawChatCommandChoice] {
+        await self.state.awaitCommandListGate()
+        return []
     }
 
     private func requestHistory(
         sessionKey: String,
+        agentID: String?,
         expectedRoute: Int?) async throws -> OpenClawChatHistoryPayload
     {
-        await self.state.recordHistoryRequest()
-        if let expectedRoute, await self.state.routeGeneration != expectedRoute {
+        await self.state.recordHistoryRequest(agentID: agentID)
+        if let expectedRoute, await state.routeGeneration != expectedRoute {
             throw CancellationError()
         }
         guard await self.state.healthy, await !self.state.historyFails else { throw OutboxSendError() }
-        if let stale = await self.state.staleHistoryRows {
+        if let stale = await state.staleHistoryRows {
             // Gateway lag: the snapshot predates the just-acked send.
             return OpenClawChatHistoryPayload(
                 sessionKey: sessionKey,
@@ -146,11 +210,16 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
                 messages: stale,
                 thinkingLevel: "off")
         }
-        let keys = await self.state.sentIdempotencyKeys
-        let texts = await self.state.sentMessages
-        let sessions = await self.state.sentSessionKeys
+        let keys = await state.sentIdempotencyKeys
+        let texts = await state.sentMessages
+        let sessions = await state.sentSessionKeys
+        let agents = await state.sentAgentIDs
         let durableUserRows = keys.indices.compactMap { index -> AnyCodable? in
-            guard index < sessions.count, sessions[index] == sessionKey else { return nil }
+            guard index < sessions.count,
+                  index < agents.count,
+                  sessions[index] == sessionKey,
+                  agents[index] == agentID
+            else { return nil }
             let key = keys[index]
             return AnyCodable([
                 "role": "user",
@@ -175,6 +244,7 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
     {
         try await self.sendMessage(
             sessionKey: sessionKey,
+            agentID: nil,
             message: message,
             thinking: thinking,
             idempotencyKey: idempotencyKey,
@@ -183,21 +253,22 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
 
     private func sendMessage(
         sessionKey: String,
+        agentID: String?,
         message: String,
         thinking: String,
         idempotencyKey: String,
         expectedRoute: Int?) async throws -> OpenClawChatSendResponse
     {
-        if let expectedRoute, await self.state.routeGeneration != expectedRoute {
+        if let expectedRoute, await state.routeGeneration != expectedRoute {
             throw CancellationError()
         }
-        if let gate = await self.state.heldSendGate {
+        if let gate = await state.heldSendGate {
             // One-shot: only the first send is held so tests can pin the
             // window where the flush is mid-drain.
             await self.state.setHeldSendGate(nil)
             await gate.wait()
         }
-        if let expectedRoute, await self.state.routeGeneration != expectedRoute {
+        if let expectedRoute, await state.routeGeneration != expectedRoute {
             throw CancellationError()
         }
         if await self.state.sendFails {
@@ -210,35 +281,67 @@ private final class OutboxTestTransport: @unchecked Sendable, OpenClawChatTransp
                 message: "rejected",
                 details: nil)
         }
+        if await self.state.sendRoutingChanged {
+            throw GatewayResponseError(
+                method: "chat.send",
+                code: "INVALID_REQUEST",
+                message: "session routing changed; review and retry",
+                details: [
+                    "reason": AnyCodable(OpenClawChatSessionRoutingContract.changedErrorReason),
+                ])
+        }
         if await self.state.sendRejects {
             // Gateway responded but refused to start the run.
             return OpenClawChatSendResponse(runId: idempotencyKey, status: "error")
         }
         await self.state.recordSend(
             sessionKey: sessionKey,
+            agentID: agentID,
             message: message,
             idempotencyKey: idempotencyKey,
             thinking: thinking)
         return OpenClawChatSendResponse(runId: idempotencyKey, status: "accepted")
     }
 
-    func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLease? {
-        let expectedRoute = await self.state.routeGeneration
+    func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLeaseResult {
+        if let routeUnavailableReason {
+            return .unavailable(reason: routeUnavailableReason)
+        }
+        if !self.requiresRoutingContract {
+            let transport = self
+            return .available(OpenClawChatTransportRouteLease(
+                sendMessage: { sessionKey, message, thinking, idempotencyKey, attachments in
+                    try await transport.sendMessage(
+                        sessionKey: sessionKey,
+                        message: message,
+                        thinking: thinking,
+                        idempotencyKey: idempotencyKey,
+                        attachments: attachments)
+                },
+                requestHistory: { sessionKey in
+                    try await transport.requestHistory(sessionKey: sessionKey)
+                }))
+        }
+        let expectedRoute = await state.routeGeneration
+        let routingContract = await state.sessionRoutingContract
         let transport = self
-        return OpenClawChatTransportRouteLease(
-            sendMessage: { sessionKey, message, thinking, idempotencyKey, _ in
+        return .available(OpenClawChatTransportRouteLease(
+            sendTargetedMessage: { sessionKey, agentID, message, thinking, idempotencyKey, _ in
                 try await transport.sendMessage(
                     sessionKey: sessionKey,
+                    agentID: agentID,
                     message: message,
                     thinking: thinking,
                     idempotencyKey: idempotencyKey,
                     expectedRoute: expectedRoute)
             },
-            requestHistory: { sessionKey in
+            requestTargetedHistory: { sessionKey, agentID in
                 try await transport.requestHistory(
                     sessionKey: sessionKey,
+                    agentID: agentID,
                     expectedRoute: expectedRoute)
-            })
+            },
+            sessionRoutingContract: routingContract))
     }
 
     /// Gated model patch: `setSessionModel` blocks until `releaseModelPatch`
@@ -271,12 +374,17 @@ private func makeOutboxViewModel(
     transport: OutboxTestTransport,
     outbox: any OpenClawChatCommandOutbox,
     transcriptCache: (any OpenClawChatTranscriptCache)? = nil,
-    retryDelaysMs: [UInt64] = [1, 1]) async -> OpenClawChatViewModel
+    retryDelaysMs: [UInt64] = [1, 1],
+    sessionKey: String = "main",
+    activeAgentID: String? = "main",
+    sessionRoutingContract: String? = "per-sender|main|main") async -> OpenClawChatViewModel
 {
     await MainActor.run {
         let vm = OpenClawChatViewModel(
-            sessionKey: "main",
+            sessionKey: sessionKey,
             transport: transport,
+            activeAgentId: activeAgentID,
+            sessionRoutingContract: sessionRoutingContract,
             transcriptCache: transcriptCache,
             outbox: outbox)
         vm.outboxRetryDelaysMs = retryDelaysMs
@@ -386,6 +494,19 @@ private actor DelayingOutbox: OpenClawChatCommandOutbox {
         await self.base.markCommandRetried(id: id)
     }
 
+    func markCommandRetriedIfPresent(
+        id: String,
+        agentID: String?,
+        deliverySessionKey: String,
+        routingContract: String) async -> OpenClawChatOutboxUpdateResult
+    {
+        await self.base.markCommandRetriedIfPresent(
+            id: id,
+            agentID: agentID,
+            deliverySessionKey: deliverySessionKey,
+            routingContract: routingContract)
+    }
+
     func deleteCommand(id: String) async {
         await self.base.deleteCommand(id: id)
     }
@@ -426,7 +547,7 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
     }
 
     func loadCommands() async -> [OpenClawChatOutboxCommand] {
-        let commands = await self.base.loadCommands()
+        let commands = await base.loadCommands()
         if self.shouldHoldNextLoad {
             self.shouldHoldNextLoad = false
             await self.captured.open()
@@ -436,7 +557,7 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
     }
 
     func loadCommandsIfAvailable() async -> [OpenClawChatOutboxCommand]? {
-        guard let commands = await self.base.loadCommandsIfAvailable() else { return nil }
+        guard let commands = await base.loadCommandsIfAvailable() else { return nil }
         if self.shouldHoldNextLoad {
             self.shouldHoldNextLoad = false
             await self.captured.open()
@@ -476,6 +597,19 @@ private actor SnapshotHoldingOutbox: OpenClawChatCommandOutbox {
 
     func markCommandRetried(id: String) async {
         await self.base.markCommandRetried(id: id)
+    }
+
+    func markCommandRetriedIfPresent(
+        id: String,
+        agentID: String?,
+        deliverySessionKey: String,
+        routingContract: String) async -> OpenClawChatOutboxUpdateResult
+    {
+        await self.base.markCommandRetriedIfPresent(
+            id: id,
+            agentID: agentID,
+            deliverySessionKey: deliverySessionKey,
+            routingContract: routingContract)
     }
 
     func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
@@ -559,8 +693,21 @@ private actor CancellationHoldingOutbox: OpenClawChatCommandOutbox {
         await self.base.markCommandRetried(id: id)
     }
 
+    func markCommandRetriedIfPresent(
+        id: String,
+        agentID: String?,
+        deliverySessionKey: String,
+        routingContract: String) async -> OpenClawChatOutboxUpdateResult
+    {
+        await self.base.markCommandRetriedIfPresent(
+            id: id,
+            agentID: agentID,
+            deliverySessionKey: deliverySessionKey,
+            routingContract: routingContract)
+    }
+
     func cancelCommand(id: String) async -> OpenClawChatOutboxUpdateResult {
-        let result = await self.base.cancelCommand(id: id)
+        let result = await base.cancelCommand(id: id)
         await self.canceled.open()
         await self.release.wait()
         return result
@@ -593,6 +740,7 @@ struct ChatViewModelOutboxTests {
         #expect(commands.map(\.text) == ["hello offline"])
         #expect(commands.map(\.status) == [.queued])
         #expect(commands.map(\.sessionKey) == ["main"])
+        #expect(commands.map(\.deliverySessionKey) == ["agent:main:main"])
 
         // The visible row carries the queued state and the draft was cleared.
         #expect(await MainActor.run { vm.input.isEmpty })
@@ -611,6 +759,305 @@ struct ChatViewModelOutboxTests {
             }
         }
         #expect(await userTexts(vm2) == ["hello offline"])
+    }
+
+    @Test func `unsupported gateway keeps queued work and surfaces upgrade action`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let message = OpenClawChatTransportUpgradeMessage.routingContract
+        let transport = OutboxTestTransport(
+            healthy: false,
+            routeUnavailableReason: message)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "wait for upgrade")
+        await transport.goOnline()
+
+        try await waitUntil("gateway upgrade guidance") {
+            await MainActor.run { vm.errorText == message }
+        }
+        #expect(await store.loadCommands().map(\.status) == [.queued])
+        #expect(await transport.state.sentMessages.isEmpty)
+    }
+
+    @Test func `legacy transport preserves its untargeted session key`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false, requiresRoutingContract: false)
+        let vm = await makeOutboxViewModel(
+            transport: transport,
+            outbox: store,
+            sessionKey: "OpaquePeer",
+            activeAgentID: nil,
+            sessionRoutingContract: nil)
+
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "legacy route")
+        let command = try #require(await store.claimNextCommand())
+        #expect(command.deliverySessionKey == "OpaquePeer")
+        #expect(command.agentID == nil)
+        #expect(await store.markCommandFailedIfPresent(
+            id: command.id,
+            retryCount: 1,
+            lastError: "legacy failure") == .updated)
+
+        let retryView = await makeOutboxViewModel(
+            transport: transport,
+            outbox: store,
+            sessionKey: "OpaquePeer",
+            activeAgentID: nil,
+            sessionRoutingContract: nil)
+        await MainActor.run { retryView.load() }
+        try await waitUntil("legacy failed bubble") {
+            await MainActor.run {
+                retryView.messages.contains { message in
+                    retryView.outboxState(for: message.id)?.isFailed == true
+                }
+            }
+        }
+        let failedMessageID = try #require(await MainActor.run { retryView.messages.last?.id })
+        await MainActor.run { retryView.retryOutboxMessage(failedMessageID) }
+        try await waitUntil("legacy retry queues") {
+            await store.loadCommands().first?.status == .queued
+        }
+
+        await transport.goOnline()
+        try await waitUntil("legacy outbox send") {
+            await transport.state.sentMessages == ["legacy route"]
+        }
+        #expect(await transport.state.sentSessionKeys == ["OpaquePeer"])
+        #expect(await transport.state.sentAgentIDs == [nil])
+    }
+
+    @Test func `reserved unknown session stays unscoped in durable delivery`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(
+            transport: transport,
+            outbox: store,
+            sessionKey: "unknown")
+
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "reserved route")
+        let command = try #require(await store.loadCommands().first)
+
+        #expect(command.deliverySessionKey == "unknown")
+        #expect(command.agentID == nil)
+
+        await transport.goOnline()
+        try await waitUntil("reserved outbox send") {
+            await transport.state.sentMessages == ["reserved route"]
+        }
+        #expect(await transport.state.sentSessionKeys == ["unknown"])
+        #expect(await transport.state.sentAgentIDs == [nil])
+    }
+
+    @Test(arguments: ["global", "main"])
+    func `mutable alias queued turn keeps its original agent target`(_ sessionKey: String) async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let offlineTransport = OutboxTestTransport(healthy: false)
+        let agentAView = await makeOutboxViewModel(
+            transport: offlineTransport,
+            outbox: store,
+            transcriptCache: store,
+            sessionKey: sessionKey,
+            activeAgentID: "agent-a")
+        await MainActor.run { agentAView.load() }
+        try await sendWhileOffline(agentAView, text: "for agent A")
+        #expect(await store.loadCommands().map(\.agentID) == ["agent-a"])
+
+        let reconnectTransport = OutboxTestTransport(healthy: false)
+        let agentBView = await makeOutboxViewModel(
+            transport: reconnectTransport,
+            outbox: store,
+            transcriptCache: store,
+            sessionKey: sessionKey,
+            activeAgentID: "agent-b")
+        await MainActor.run { agentBView.load() }
+        try await waitUntil("agent B restore completes without adopting agent A bubble") {
+            await MainActor.run { agentBView.hasRestoredOutboxMessages }
+        }
+        #expect(await userTexts(agentBView).isEmpty)
+
+        await reconnectTransport.goOnline()
+        try await waitUntil("agent A command drains after agent B reconnects") {
+            await store.loadCommands().isEmpty
+        }
+        let deliverySessionKey = sessionKey == "global" ? "global" : "agent:agent-a:main"
+        #expect(await reconnectTransport.state.sentSessionKeys == [deliverySessionKey])
+        #expect(await reconnectTransport.state.sentAgentIDs == ["agent-a"])
+        #expect(await reconnectTransport.state.historyRequestAgentIDs.contains("agent-a"))
+        #expect(await store.loadTranscript(sessionKey: sessionKey, agentID: "agent-a")
+            .map { $0.content.compactMap(\.text).joined() } == ["for agent A"])
+        #expect(await store.loadTranscript(sessionKey: sessionKey, agentID: "agent-b").isEmpty)
+    }
+
+    @Test func `unscoped opaque peer ID preserves case in its durable target`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let sessionKey = "Matrix:Channel:!MixedRoomAbCdEf:example.org"
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(
+            transport: transport,
+            outbox: store,
+            sessionKey: sessionKey,
+            activeAgentID: "agent-a")
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "preserve opaque room")
+
+        let command = try #require(await store.loadCommands().first)
+        #expect(command.deliverySessionKey == "agent:agent-a:\(sessionKey)")
+
+        await transport.goOnline()
+        try await waitUntil("mixed-case target drains") {
+            await store.loadCommands().isEmpty
+        }
+        #expect(await transport.state.sentSessionKeys == ["agent:agent-a:\(sessionKey)"])
+    }
+
+    @Test func `changed default agent parks command visibly for retry`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let oldTransport = OutboxTestTransport(healthy: false)
+        await oldTransport.state.setSessionRoutingContract("per-sender|main|agent-a")
+        let oldView = await makeOutboxViewModel(
+            transport: oldTransport,
+            outbox: store,
+            activeAgentID: "agent-a",
+            sessionRoutingContract: "per-sender|main|agent-a")
+        await MainActor.run { oldView.load() }
+        try await sendWhileOffline(oldView, text: "old main target")
+
+        let newTransport = OutboxTestTransport(healthy: false)
+        await newTransport.state.setSessionRoutingContract("per-sender|main|agent-b")
+        let newView = await makeOutboxViewModel(
+            transport: newTransport,
+            outbox: store,
+            activeAgentID: "agent-b",
+            sessionRoutingContract: "per-sender|main|agent-b")
+        await MainActor.run { newView.load() }
+
+        await newTransport.goOnline()
+        try await waitUntil("changed target is parked") {
+            await store.loadCommands().map(\.status) == [.failed]
+        }
+        #expect(await store.loadCommands().first?.lastError ==
+            OpenClawChatSQLiteTranscriptCache.outboxChangedTargetError)
+        #expect(await newTransport.state.sentMessages.isEmpty)
+        try await waitUntil("parked target stays visible") {
+            await MainActor.run {
+                newView.messages.contains { newView.outboxState(for: $0.id)?.isFailed == true }
+            }
+        }
+
+        let messageID = try #require(await MainActor.run {
+            newView.messages.first { newView.outboxState(for: $0.id)?.isFailed == true }?.id
+        })
+        await MainActor.run { newView.retryOutboxMessage(messageID) }
+        try await waitUntil("changed target retry drains") {
+            await store.loadCommands().isEmpty
+        }
+        #expect(await newTransport.state.sentAgentIDs == ["agent-b"])
+        #expect(await newTransport.state.sentSessionKeys == ["agent:agent-b:main"])
+    }
+
+    @Test func `atomic gateway routing rejection parks without retrying`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+        await MainActor.run { vm.load() }
+        try await sendWhileOffline(vm, text: "do not cross config reload")
+
+        await transport.state.setSendRoutingChanged(true)
+        await transport.goOnline()
+        try await waitUntil("atomic routing rejection parks") {
+            await store.loadCommands().first?.status == .failed
+        }
+        let command = try #require(await store.loadCommands().first)
+        #expect(command.lastError == OpenClawChatSQLiteTranscriptCache.outboxChangedTargetError)
+        #expect(command.retryCount == 0)
+        #expect(await transport.state.sentMessages.isEmpty)
+    }
+
+    @Test func `failed alias row remains reachable after owner change`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+            id: "c-old-failure",
+            sessionKey: "main",
+            deliverySessionKey: "agent:agent-a:main",
+            routingContract: "per-sender|main|agent-a",
+            agentID: "agent-a",
+            text: "review old failure",
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .failed,
+            retryCount: 1,
+            lastError: OpenClawChatSQLiteTranscriptCache.outboxExpiredError)))
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(
+            transport: transport,
+            outbox: store,
+            activeAgentID: "agent-b",
+            sessionRoutingContract: "per-sender|main|agent-b")
+
+        await MainActor.run { vm.load() }
+        try await waitUntil("old failed row stays visible") {
+            await MainActor.run {
+                vm.messages.contains { vm.outboxState(for: $0.id)?.isFailed == true }
+            }
+        }
+        let messageID = try #require(await MainActor.run { vm.messages.last?.id })
+        await MainActor.run { vm.deleteOutboxMessage(messageID) }
+        try await waitUntil("old failed row can be deleted") { await store.loadCommands().isEmpty }
+    }
+
+    @Test func `ownerless global retry stays failed without a selected agent`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+            id: "c-ownerless",
+            sessionKey: "global",
+            text: "choose my owner",
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .failed,
+            retryCount: 0,
+            lastError: OpenClawChatSQLiteTranscriptCache.outboxUnknownTargetError)))
+        let transport = OutboxTestTransport(healthy: false)
+        let vm = await makeOutboxViewModel(
+            transport: transport,
+            outbox: store,
+            sessionKey: "global",
+            activeAgentID: nil)
+        await MainActor.run { vm.load() }
+        try await waitUntil("ownerless failed row visible") {
+            await MainActor.run { vm.messages.contains { vm.outboxState(for: $0.id)?.isFailed == true } }
+        }
+        let messageID = try #require(await MainActor.run {
+            vm.messages.first { vm.outboxState(for: $0.id)?.isFailed == true }?.id
+        })
+
+        await MainActor.run { vm.retryOutboxMessage(messageID) }
+        try await waitUntil("ownerless retry asks for an agent") {
+            await MainActor.run { vm.errorText == "Select an agent before retrying this message." }
+        }
+        let command = await store.loadCommands().first
+        #expect(command?.status == .failed)
+        #expect(command?.agentID == nil)
     }
 
     @Test func `unavailable recovery keeps the live send FIFO gate closed`() async throws {
@@ -651,7 +1098,7 @@ struct ChatViewModelOutboxTests {
         // here, keyed by its client UUID, in strict createdAt order.
         #expect(await transport.state.sentIdempotencyKeys == queuedIDs)
         #expect(await transport.state.sentMessages == ["first", "second"])
-        #expect(await transport.state.sentSessionKeys == ["main", "main"])
+        #expect(await transport.state.sentSessionKeys == ["agent:main:main", "agent:main:main"])
 
         // Durable history replaced the queued bubbles without duplicating
         // them, and no outbox state markers remain.
@@ -664,7 +1111,7 @@ struct ChatViewModelOutboxTests {
         // Crash-window durability: the sent turns were written through to the
         // transcript cache no later than outbox-row deletion, so a cold
         // offline reopen still shows them.
-        let cached = await store.loadTranscript(sessionKey: "main")
+        let cached = await store.loadTranscript(sessionKey: "main", agentID: "main")
         let cachedUserTexts = cached
             .filter { $0.role == "user" }
             .map { $0.content.compactMap(\.text).joined() }
@@ -760,7 +1207,7 @@ struct ChatViewModelOutboxTests {
             await store.loadCommands().map(\.status) == [.awaitingConfirmation]
         }
 
-        let cached = await store.loadTranscript(sessionKey: "main")
+        let cached = await store.loadTranscript(sessionKey: "main", agentID: "main")
         #expect(cached.map { $0.content.compactMap(\.text).joined() } == ["must survive"])
         #expect(await MainActor.run {
             vm.messages.contains { vm.outboxState(for: $0.id) == .confirming }
@@ -787,6 +1234,7 @@ struct ChatViewModelOutboxTests {
         let transport = OutboxTestTransport(healthy: true)
         await transport.state.recordSend(
             sessionKey: "main",
+            agentID: nil,
             message: "already acknowledged",
             idempotencyKey: "c-awaiting",
             thinking: "off")
@@ -938,6 +1386,7 @@ struct ChatViewModelOutboxTests {
         #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
             id: "c-terminal-write",
             sessionKey: "main",
+            routingContract: "per-sender|main|main",
             text: "do not skip me",
             thinking: "off",
             createdAt: Date().timeIntervalSince1970,
@@ -1120,6 +1569,7 @@ struct ChatViewModelOutboxTests {
             OpenClawChatOutboxCommand(
                 id: "c-think",
                 sessionKey: "other-session",
+                routingContract: "per-sender|main|main",
                 text: "think hard",
                 thinking: "high",
                 createdAt: Date().timeIntervalSince1970,
@@ -1148,6 +1598,7 @@ struct ChatViewModelOutboxTests {
             OpenClawChatOutboxCommand(
                 id: "c-background",
                 sessionKey: "other-session",
+                routingContract: "per-sender|main|main",
                 text: "sent from elsewhere",
                 thinking: "off",
                 createdAt: Date().timeIntervalSince1970,
@@ -1317,7 +1768,7 @@ struct ChatViewModelOutboxTests {
             await store.loadCommands().isEmpty
         }
         try await waitUntil("canceled bubble removed from transcript cache") {
-            await store.loadTranscript(sessionKey: "main").isEmpty
+            await store.loadTranscript(sessionKey: "main", agentID: "main").isEmpty
         }
 
         // A later cold open must not repaint the canceled local bubble as an
@@ -1377,6 +1828,34 @@ extension ChatViewModelOutboxTests {
         #expect(await MainActor.run { queuedStateCount(vm) } == 1)
     }
 
+    @Test func `double submit during slash validation enqueues once`() async throws {
+        let url = try makeOutboxDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-test")
+        let transport = OutboxTestTransport(healthy: false, supportsSlashCommands: true)
+        let commandListGate = DeleteGate()
+        await transport.state.setCommandListGate(commandListGate)
+        let vm = await makeOutboxViewModel(transport: transport, outbox: store)
+
+        await MainActor.run {
+            vm.input = "/remote-command"
+            vm.send()
+        }
+        await transport.state.waitUntilCommandListStarted()
+        await MainActor.run {
+            vm.input = "newer draft"
+            #expect(!vm.canSend)
+            vm.send()
+        }
+        await commandListGate.open()
+
+        try await waitUntil("slash command queued once") {
+            await store.loadCommands().count == 1
+        }
+        #expect(await store.loadCommands().map(\.text) == ["/remote-command"])
+        #expect(await MainActor.run { vm.input } == "newer draft")
+    }
+
     @Test func `stale history after the flush ack cannot evict the sent turn from the cache`() async throws {
         let url = try makeOutboxDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -1410,7 +1889,7 @@ extension ChatViewModelOutboxTests {
         if let pendingWrite = await MainActor.run(body: { vm.pendingCacheWriteTask }) {
             await pendingWrite.value
         }
-        let cached = await store.loadTranscript(sessionKey: "main")
+        let cached = await store.loadTranscript(sessionKey: "main", agentID: "main")
         #expect(cached.contains { message in
             message.content.contains { $0.text == "must survive stale history" }
         })
@@ -1429,6 +1908,7 @@ extension ChatViewModelOutboxTests {
         #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
             id: UUID().uuidString,
             sessionKey: "main",
+            routingContract: "per-sender|main|main",
             text: "queued by the previous launch",
             thinking: "off",
             createdAt: Date().timeIntervalSince1970 - 60,
@@ -1467,6 +1947,7 @@ extension ChatViewModelOutboxTests {
         #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
             id: UUID().uuidString,
             sessionKey: "second",
+            routingContract: "per-sender|main|main",
             text: "backlog in second session",
             thinking: "off",
             createdAt: Date().timeIntervalSince1970 - 60,
@@ -1659,7 +2140,12 @@ extension ChatViewModelOutboxTests {
         let staleOutbox = SnapshotHoldingOutbox(base: store)
         await staleOutbox.holdNextLoad()
         let staleView = await MainActor.run {
-            OpenClawChatViewModel(sessionKey: "main", transport: transport, outbox: staleOutbox)
+            OpenClawChatViewModel(
+                sessionKey: "main",
+                transport: transport,
+                activeAgentId: "main",
+                sessionRoutingContract: "per-sender|main|main",
+                outbox: staleOutbox)
         }
         await MainActor.run { staleView.load() }
         await staleOutbox.waitUntilSnapshotCaptured()
@@ -1686,7 +2172,12 @@ extension ChatViewModelOutboxTests {
         let outbox = SnapshotHoldingOutbox(base: store)
         let transport = OutboxTestTransport(healthy: false)
         let vm = await MainActor.run {
-            OpenClawChatViewModel(sessionKey: "main", transport: transport, outbox: outbox)
+            OpenClawChatViewModel(
+                sessionKey: "main",
+                transport: transport,
+                activeAgentId: "main",
+                sessionRoutingContract: "per-sender|main|main",
+                outbox: outbox)
         }
 
         await MainActor.run { vm.load() }

@@ -178,6 +178,46 @@ struct ChatTranscriptCacheStoreTests {
         #expect(await messageTexts(storeB.loadTranscript(sessionKey: "main")) == ["gateway B"])
     }
 
+    @Test func `global transcripts are scoped per agent identity`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+
+        await store.storeTranscript(
+            sessionKey: "global",
+            agentID: "agent-a",
+            messages: [cacheMessage(
+                role: "user",
+                text: "agent A",
+                timestamp: 1,
+                idempotencyKey: "c-agent-a:user")])
+        await store.storeTranscript(
+            sessionKey: "global",
+            agentID: "agent-b",
+            messages: [cacheMessage(role: "user", text: "agent B", timestamp: 2)])
+
+        let agentAMessages = await store.loadTranscript(sessionKey: "global", agentID: "agent-a")
+        let agentBMessages = await store.loadTranscript(sessionKey: "global", agentID: "agent-b")
+        #expect(messageTexts(agentAMessages) == ["agent A"])
+        #expect(messageTexts(agentBMessages) == ["agent B"])
+        #expect(await store.loadTranscript(sessionKey: "global").isEmpty)
+
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+            id: "c-agent-a",
+            sessionKey: "global",
+            agentID: "agent-a",
+            text: "agent A",
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .queued,
+            retryCount: 0,
+            lastError: nil)))
+        #expect(await store.cancelCommand(id: "c-agent-a") == .updated)
+        #expect(await store.loadTranscript(sessionKey: "global", agentID: "agent-a").isEmpty)
+        let survivingAgentBMessages = await store.loadTranscript(sessionKey: "global", agentID: "agent-b")
+        #expect(messageTexts(survivingAgentBMessages) == ["agent B"])
+    }
+
     @Test func `empty transcript store clears cached row`() async throws {
         let url = try makeDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -300,6 +340,233 @@ struct ChatTranscriptCacheStoreTests {
         #expect(await migrated.loadCommands().map(\.text) == ["preserved migration"])
     }
 
+    @Test func `v2 migration parks rows without a routing contract`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let now = Date().timeIntervalSince1970
+        do {
+            let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+            #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+                id: "c-global",
+                sessionKey: "global",
+                agentID: "agent-a",
+                text: "targeted before downgrade",
+                thinking: "off",
+                createdAt: now,
+                status: .queued,
+                retryCount: 0,
+                lastError: nil)))
+            #expect(await store.enqueueCommand(outboxCommand(
+                id: "c-main",
+                sessionKey: "main",
+                text: "mutable main alias",
+                createdAt: now + 0.5)))
+            #expect(await store.enqueueCommand(outboxCommand(
+                id: "c-scoped",
+                sessionKey: "agent:agent-a:main",
+                text: "already scoped",
+                createdAt: now + 1)))
+            #expect(await store.enqueueCommand(outboxCommand(
+                id: "c-matrix",
+                sessionKey: "agent:agent-a:matrix:channel:!MixedRoomAbCdEf:example.org",
+                text: "case-sensitive room",
+                createdAt: now + 2)))
+            #expect(await store.enqueueCommand(outboxCommand(
+                id: "c-empty-agent",
+                sessionKey: "agent::main",
+                text: "missing agent",
+                createdAt: now + 3)))
+            #expect(await store.enqueueCommand(outboxCommand(
+                id: "c-empty-rest",
+                sessionKey: "agent:agent-a:",
+                text: "missing session",
+                createdAt: now + 4)))
+            await store.retire()
+        }
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "UPDATE outbox_commands SET status = 'sending' WHERE client_uuid = 'c-scoped'",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "UPDATE outbox_commands SET status = 'awaiting_confirmation' WHERE client_uuid = 'c-matrix'",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "ALTER TABLE outbox_commands DROP COLUMN agent_id", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands DROP COLUMN delivery_session_key",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands DROP COLUMN routing_contract",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "PRAGMA user_version = 2", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        let migrated = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        let commands = await migrated.loadCommands()
+        #expect(commands.map(\.agentID) == [nil, nil, nil, nil, nil, nil])
+        #expect(commands.map(\.deliverySessionKey) == [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ])
+        #expect(commands.map(\.status) == [.failed, .failed, .failed, .failed, .failed, .failed])
+        #expect(commands.map(\.lastError) == [
+            OpenClawChatSQLiteTranscriptCache.outboxUnknownTargetError,
+            OpenClawChatSQLiteTranscriptCache.outboxUnknownTargetError,
+            OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError,
+            OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError,
+            OpenClawChatSQLiteTranscriptCache.outboxUnknownTargetError,
+            OpenClawChatSQLiteTranscriptCache.outboxUnknownTargetError,
+        ])
+        #expect(await migrated.markCommandRetriedIfPresent(
+            id: "c-global",
+            agentID: "agent-b",
+            deliverySessionKey: "global",
+            routingContract: "per-sender|main|agent-b") == .updated)
+        let retried = await migrated.loadCommands().first { $0.id == "c-global" }
+        #expect(retried?.agentID == "agent-b")
+        #expect(retried?.deliverySessionKey == "global")
+        #expect(retried?.routingContract == "per-sender|main|agent-b")
+        #expect(retried?.status == .queued)
+    }
+
+    @Test func `unknown failed command can retry without an agent`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+            id: "c-unknown",
+            sessionKey: "unknown",
+            deliverySessionKey: "unknown",
+            routingContract: "per-sender|main|main",
+            agentID: nil,
+            text: "retry reserved",
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .failed,
+            retryCount: 1,
+            lastError: "failed")))
+
+        #expect(await store.markCommandRetriedIfPresent(
+            id: "c-unknown",
+            agentID: nil,
+            deliverySessionKey: "unknown",
+            routingContract: "per-sender|main|main") == .updated)
+        let command = try #require(await store.loadCommands().first)
+        #expect(command.status == .queued)
+        #expect(command.agentID == nil)
+        #expect(command.deliverySessionKey == "unknown")
+    }
+
+    @Test func `retargeted retry removes optimistic row from previous agent cache`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        await store.storeTranscript(
+            sessionKey: "main",
+            agentID: "agent-a",
+            messages: [
+                cacheMessage(
+                    role: "user",
+                    text: "old owner",
+                    timestamp: 1,
+                    idempotencyKey: "c-retarget:user"),
+            ])
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+            id: "c-retarget",
+            sessionKey: "main",
+            deliverySessionKey: "agent:agent-a:main",
+            routingContract: "per-sender|main|agent-a",
+            agentID: "agent-a",
+            text: "old owner",
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .failed,
+            retryCount: 1,
+            lastError: "changed")))
+
+        #expect(await store.markCommandRetriedIfPresent(
+            id: "c-retarget",
+            agentID: "agent-b",
+            deliverySessionKey: "agent:agent-b:main",
+            routingContract: "per-sender|main|agent-b") == .updated)
+        #expect(await store.loadTranscript(sessionKey: "main", agentID: "agent-a").isEmpty)
+        let command = try #require(await store.loadCommands().first)
+        #expect(command.agentID == "agent-b")
+        #expect(command.status == .queued)
+    }
+
+    @Test func `v3 migration preserves delivery ambiguity without a routing contract`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        do {
+            let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+            #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+                id: "c-v3",
+                sessionKey: "main",
+                deliverySessionKey: "agent:agent-a:main",
+                routingContract: "per-sender|main|agent-a",
+                agentID: "agent-a",
+                text: "park after downgrade",
+                thinking: "off",
+                createdAt: Date().timeIntervalSince1970,
+                status: .queued,
+                retryCount: 0,
+                lastError: nil)))
+            #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+                id: "c-v3-acked",
+                sessionKey: "main",
+                deliverySessionKey: "agent:agent-a:main",
+                routingContract: "per-sender|main|agent-a",
+                agentID: "agent-a",
+                text: "possibly delivered",
+                thinking: "off",
+                createdAt: Date().timeIntervalSince1970 + 1,
+                status: .awaitingConfirmation,
+                retryCount: 0,
+                lastError: nil)))
+            await store.retire()
+        }
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "ALTER TABLE outbox_commands DROP COLUMN routing_contract",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "PRAGMA user_version = 3", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close_v2(raw)
+
+        let migrated = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        let commands = await migrated.loadCommands()
+        #expect(commands.map(\.status) == [.failed, .failed])
+        #expect(commands.map(\.agentID) == [nil, nil])
+        #expect(commands.map(\.deliverySessionKey) == ["", ""])
+        #expect(commands.map(\.routingContract) == [nil, nil])
+        #expect(commands.map(\.lastError) == [
+            OpenClawChatSQLiteTranscriptCache.outboxUnknownTargetError,
+            OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError,
+        ])
+    }
+
     @Test func `unknown schema preserves durable outbox bytes and fails closed`() async throws {
         let url = try makeDatabaseURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -322,7 +589,12 @@ struct ChatTranscriptCacheStoreTests {
         // or rebuild the persistent outbox table.
         raw = nil
         #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
-        #expect(sqlite3_exec(raw, "PRAGMA user_version = 2", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            raw,
+            "PRAGMA user_version = \(OpenClawChatSQLiteTranscriptCache.schemaVersion)",
+            nil,
+            nil,
+            nil) == SQLITE_OK)
         sqlite3_close_v2(raw)
         let recovered = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
         #expect(await recovered.loadCommands().map(\.text) == ["do not delete"])
@@ -468,6 +740,35 @@ struct ChatCommandOutboxStoreTests {
             canonicalMessageIdempotencyKeys: ["c-canonical-first:user"])
         #expect(await store.cancelCommand(id: "c-canonical-first") == .confirmed)
         #expect(await messageTexts(store.loadTranscript(sessionKey: "main")) == ["already landed"])
+    }
+
+    @Test func `scoped cancellation scrubs the canonical transcript partition`() async throws {
+        let url = try makeDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = OpenClawChatSQLiteTranscriptCache(databaseURL: url, gatewayID: "gw-a")
+        let sessionKey = "agent:agent-a:matrix:channel:!MixedRoomAbCdEf:example.org"
+        #expect(await store.enqueueCommand(OpenClawChatOutboxCommand(
+            id: "c-scoped-cancel",
+            sessionKey: sessionKey,
+            agentID: "agent-a",
+            text: "cancel scoped",
+            thinking: "off",
+            createdAt: Date().timeIntervalSince1970,
+            status: .queued,
+            retryCount: 0,
+            lastError: nil)))
+        let staleSnapshot = [cacheMessage(
+            role: "user",
+            text: "cancel scoped",
+            timestamp: 1,
+            idempotencyKey: "c-scoped-cancel:user")]
+        await store.storeTranscript(sessionKey: sessionKey, messages: staleSnapshot)
+
+        #expect(await store.cancelCommand(id: "c-scoped-cancel") == .updated)
+        #expect(await store.loadTranscript(sessionKey: sessionKey).isEmpty)
+
+        await store.storeTranscript(sessionKey: sessionKey, messages: staleSnapshot)
+        #expect(await store.loadTranscript(sessionKey: sessionKey).isEmpty)
     }
 
     @Test func `cancellation lookup failure preserves the queued command`() async throws {

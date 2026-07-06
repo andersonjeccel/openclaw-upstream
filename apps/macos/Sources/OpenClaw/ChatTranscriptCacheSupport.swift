@@ -79,7 +79,7 @@ enum MacChatTranscriptCache {
     /// Concrete return type: the same SQLite store also backs the offline
     /// command outbox, and callers wire both protocol facets from one instance.
     @MainActor
-    static func make() -> OpenClawChatSQLiteTranscriptCache? {
+    static func currentGatewayID() -> String? {
         let root = OpenClawConfigFile.loadDict()
         let mode = ConnectionModeResolver.resolve(root: root).mode
         let resolution = GatewayRemoteConfig.resolveTransportResolution(root: root)
@@ -91,14 +91,18 @@ enum MacChatTranscriptCache {
         let sshRemotePort = RemotePortTunnel.resolveRemotePortOverride(
             defaultRemotePort: defaultRemotePort,
             for: sshHost) ?? defaultRemotePort
-        let gatewayID = self.gatewayID(
+        return self.gatewayID(
             mode: mode,
             localStateDir: OpenClawConfigFile.stateDirURL(),
             remoteTransport: resolution.transport,
             directURL: resolution.directURL,
             sshTarget: sshTarget,
             sshRemotePort: sshRemotePort)
-        guard let gatewayID else { return nil }
+    }
+
+    @MainActor
+    static func make() -> OpenClawChatSQLiteTranscriptCache? {
+        guard let gatewayID = currentGatewayID() else { return nil }
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         else {
             return nil
@@ -109,7 +113,7 @@ enum MacChatTranscriptCache {
 
     @MainActor
     static func store(databaseURL: URL, gatewayID: String) -> OpenClawChatSQLiteTranscriptCache {
-        if let store = self.storesByGatewayID[gatewayID] {
+        if let store = storesByGatewayID[gatewayID] {
             return store
         }
         let store = OpenClawChatSQLiteTranscriptCache(databaseURL: databaseURL, gatewayID: gatewayID)

@@ -20,31 +20,78 @@ public struct OpenClawChatTransportRouteLease: Sendable {
         _ idempotencyKey: String,
         _ attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
     public typealias RequestHistory = @Sendable (String) async throws -> OpenClawChatHistoryPayload
+    public typealias SendTargetedMessage = @Sendable (
+        _ sessionKey: String,
+        _ agentID: String?,
+        _ message: String,
+        _ thinking: String,
+        _ idempotencyKey: String,
+        _ attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
+    public typealias RequestTargetedHistory = @Sendable (
+        _ sessionKey: String,
+        _ agentID: String?) async throws -> OpenClawChatHistoryPayload
 
-    private let sendMessageImpl: SendMessage
-    private let requestHistoryImpl: RequestHistory
+    private let sendTargetedMessageImpl: SendTargetedMessage
+    private let requestTargetedHistoryImpl: RequestTargetedHistory
+    public let sessionRoutingContract: String?
 
     public init(
         sendMessage: @escaping SendMessage,
-        requestHistory: @escaping RequestHistory)
+        requestHistory: @escaping RequestHistory,
+        sessionRoutingContract: String? = nil)
     {
-        self.sendMessageImpl = sendMessage
-        self.requestHistoryImpl = requestHistory
+        self.sessionRoutingContract = sessionRoutingContract
+        self.sendTargetedMessageImpl = { sessionKey, _, message, thinking, idempotencyKey, attachments in
+            try await sendMessage(sessionKey, message, thinking, idempotencyKey, attachments)
+        }
+        self.requestTargetedHistoryImpl = { sessionKey, _ in
+            try await requestHistory(sessionKey)
+        }
+    }
+
+    public init(
+        sendTargetedMessage: @escaping SendTargetedMessage,
+        requestTargetedHistory: @escaping RequestTargetedHistory,
+        sessionRoutingContract: String? = nil)
+    {
+        self.sessionRoutingContract = sessionRoutingContract
+        self.sendTargetedMessageImpl = sendTargetedMessage
+        self.requestTargetedHistoryImpl = requestTargetedHistory
     }
 
     public func sendMessage(
         sessionKey: String,
+        agentID: String? = nil,
         message: String,
         thinking: String,
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
     {
-        try await self.sendMessageImpl(sessionKey, message, thinking, idempotencyKey, attachments)
+        try await self.sendTargetedMessageImpl(
+            sessionKey,
+            agentID,
+            message,
+            thinking,
+            idempotencyKey,
+            attachments)
     }
 
-    public func requestHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload {
-        try await self.requestHistoryImpl(sessionKey)
+    public func requestHistory(
+        sessionKey: String,
+        agentID: String? = nil) async throws -> OpenClawChatHistoryPayload
+    {
+        try await self.requestTargetedHistoryImpl(sessionKey, agentID)
     }
+}
+
+public enum OpenClawChatTransportRouteLeaseResult: Sendable {
+    case available(OpenClawChatTransportRouteLease)
+    case unavailable(reason: String?)
+}
+
+public enum OpenClawChatTransportUpgradeMessage {
+    public static let routingContract =
+        "Update the gateway before sending queued messages. This version requires safe delivery routing."
 }
 
 public protocol OpenClawChatTransport: Sendable {
@@ -64,10 +111,19 @@ public protocol OpenClawChatTransport: Sendable {
         thinking: String,
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
+    func sendMessage(
+        sessionKey: String,
+        agentID: String?,
+        expectedSessionRoutingContract: String?,
+        message: String,
+        thinking: String,
+        idempotencyKey: String,
+        attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
 
     /// Captures the current route for a durable outbox flush. Implementations
     /// backed by a mutable gateway must override this with route-checked calls.
-    func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLease?
+    func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLeaseResult
+    var outboxRequiresSessionRoutingContract: Bool { get }
 
     func abortRun(sessionKey: String, runId: String) async throws
     func listSessions(limit: Int?) async throws -> OpenClawChatSessionsListResponse
@@ -94,9 +150,13 @@ public protocol OpenClawChatTransport: Sendable {
 }
 
 extension OpenClawChatTransport {
-    public func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLease? {
+    public var outboxRequiresSessionRoutingContract: Bool {
+        false
+    }
+
+    public func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLeaseResult {
         let transport = self
-        return OpenClawChatTransportRouteLease(
+        return .available(OpenClawChatTransportRouteLease(
             sendMessage: { sessionKey, message, thinking, idempotencyKey, attachments in
                 try await transport.sendMessage(
                     sessionKey: sessionKey,
@@ -107,7 +167,24 @@ extension OpenClawChatTransport {
             },
             requestHistory: { sessionKey in
                 try await transport.requestHistory(sessionKey: sessionKey)
-            })
+            }))
+    }
+
+    public func sendMessage(
+        sessionKey: String,
+        agentID _: String?,
+        expectedSessionRoutingContract _: String?,
+        message: String,
+        thinking: String,
+        idempotencyKey: String,
+        attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
+    {
+        try await self.sendMessage(
+            sessionKey: sessionKey,
+            message: message,
+            thinking: thinking,
+            idempotencyKey: idempotencyKey,
+            attachments: attachments)
     }
 
     public func createSession(
@@ -221,5 +298,26 @@ extension OpenClawChatTransport {
             domain: "OpenClawChatTransport",
             code: 0,
             userInfo: [NSLocalizedDescriptionKey: "sessions.patch(thinkingLevel) not supported by this transport"])
+    }
+}
+
+public enum OpenClawChatSessionRoutingContract {
+    public static let changedErrorReason = "session-routing-changed"
+
+    public static func make(
+        scope: String?,
+        mainKey: String?,
+        defaultAgentID: String?) -> String?
+    {
+        let normalizedScope = self.normalize(scope)
+        let normalizedMainKey = self.normalize(mainKey)
+        let normalizedDefaultAgentID = self.normalize(defaultAgentID)
+        guard let normalizedScope, let normalizedMainKey, let normalizedDefaultAgentID else { return nil }
+        return "\(normalizedScope)|\(normalizedMainKey)|\(normalizedDefaultAgentID)"
+    }
+
+    private static func normalize(_ value: String?) -> String? {
+        let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized?.isEmpty == false ? normalized : nil
     }
 }

@@ -210,6 +210,7 @@ final class NodeAppModel {
     }
 
     private var mainSessionBaseKey: String = "main"
+    private var gatewaySessionScope: String?
     private var focusedChatSessionKey: String?
     // Two-part unread guard mirroring Android: the opened key survives read
     // confirmations so later unread episodes on the same open chat re-acknowledge;
@@ -338,7 +339,7 @@ final class NodeAppModel {
         }
         return IOSGatewayChatTransport(
             gateway: self.operatorSession,
-            globalAgentId: self.chatAgentId,
+            globalAgentId: chatDeliveryAgentId,
             outboxGatewayID: outboxGatewayID)
     }
 
@@ -378,23 +379,23 @@ final class NodeAppModel {
     /// retire/purge can close every open handle). Nil for fixture/unpaired
     /// transports: no cache and no outbox.
     func makeChatOfflineStore() -> OpenClawChatSQLiteTranscriptCache? {
-        guard let gatewayID = self.chatTranscriptCacheGatewayID else { return nil }
-        if let cache = self.chatTranscriptCachesByGatewayID[gatewayID] {
+        guard let gatewayID = chatTranscriptCacheGatewayID else { return nil }
+        if let cache = chatTranscriptCachesByGatewayID[gatewayID] {
             return cache
         }
-        guard let databaseURL = self.chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return nil }
+        guard let databaseURL = chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return nil }
         let cache = OpenClawChatSQLiteTranscriptCache(databaseURL: databaseURL, gatewayID: gatewayID)
         self.chatTranscriptCachesByGatewayID[gatewayID] = cache
         return cache
     }
 
     func loadCachedChatSessions() async -> [OpenClawChatSessionEntry] {
-        guard let cache = self.makeChatOfflineStore() else { return [] }
+        guard let cache = makeChatOfflineStore() else { return [] }
         return await cache.loadSessions()
     }
 
     func storeCachedChatSessions(_ sessions: [OpenClawChatSessionEntry]) async {
-        guard let cache = self.makeChatOfflineStore() else { return }
+        guard let cache = makeChatOfflineStore() else { return }
         await cache.storeSessions(sessions)
     }
 
@@ -404,8 +405,8 @@ final class NodeAppModel {
     /// drops that gateway's queued commands.
     func purgeChatTranscriptCache(gatewayID: String? = nil) async {
         if let gatewayID, !gatewayID.isEmpty {
-            guard let databaseURL = self.chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return }
-            if let cache = self.chatTranscriptCachesByGatewayID[gatewayID] {
+            guard let databaseURL = chatTranscriptCacheDatabaseURL(gatewayID: gatewayID) else { return }
+            if let cache = chatTranscriptCachesByGatewayID[gatewayID] {
                 await cache.retire()
             }
             OpenClawChatSQLiteTranscriptCache.removeDatabaseFiles(at: databaseURL)
@@ -419,7 +420,7 @@ final class NodeAppModel {
         for cache in self.chatTranscriptCachesByGatewayID.values {
             await cache.retire()
         }
-        if let directoryURL = self.chatTranscriptCacheDirectoryURL() {
+        if let directoryURL = chatTranscriptCacheDirectoryURL() {
             try? FileManager.default.removeItem(at: directoryURL)
         }
         self.chatTranscriptCachesByGatewayID.removeAll()
@@ -429,7 +430,7 @@ final class NodeAppModel {
     /// Debug launch reset runs before Chat can create a cache actor, so direct
     /// file removal preserves the launch flag's synchronous startup contract.
     func purgeChatTranscriptCacheBeforeStartup() {
-        guard let directoryURL = self.chatTranscriptCacheDirectoryURL() else { return }
+        guard let directoryURL = chatTranscriptCacheDirectoryURL() else { return }
         try? FileManager.default.removeItem(at: directoryURL)
         self.chatTranscriptCachesByGatewayID.removeAll()
         self.chatTranscriptCacheGeneration &+= 1
@@ -1020,9 +1021,11 @@ final class NodeAppModel {
             guard let config = json["config"] as? [String: Any] else { return }
             let session = config["session"] as? [String: Any]
             let mainKey = SessionKey.normalizeMainKey(session?["mainKey"] as? String)
+            let scope = (session?["scope"] as? String) ?? "per-sender"
             guard shouldApply() else { return }
             await MainActor.run {
                 self.mainSessionBaseKey = mainKey
+                self.gatewaySessionScope = scope
                 self.talkMode.updateMainSessionKey(self.mainSessionKey)
                 self.homeCanvasRevision &+= 1
             }
@@ -1045,6 +1048,7 @@ final class NodeAppModel {
             await MainActor.run {
                 self.gatewayDefaultAgentId = decoded.defaultid
                 self.gatewayAgents = decoded.agents
+                self.gatewaySessionScope = decoded.scope.value as? String
                 self.applyMainSessionKey(decoded.mainkey)
 
                 let selected = (self.selectedAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2353,6 +2357,26 @@ extension NodeAppModel {
         return self.selectedOrDefaultAgentId
     }
 
+    /// Verified routing owner for sends. Unlike `chatAgentId`, this has no
+    /// display fallback: a cold offline start must wait for persisted or
+    /// gateway-provided ownership before it can queue durable work.
+    var chatDeliveryAgentId: String? {
+        if let sessionAgentId = SessionKey.agentId(from: chatSessionKey) {
+            return sessionAgentId.lowercased()
+        }
+        let selected = (selectedAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !selected.isEmpty { return selected.lowercased() }
+        let defaultId = (gatewayDefaultAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return defaultId.isEmpty ? nil : defaultId.lowercased()
+    }
+
+    var chatSessionRoutingContract: String? {
+        OpenClawChatSessionRoutingContract.make(
+            scope: self.gatewaySessionScope,
+            mainKey: self.mainSessionBaseKey,
+            defaultAgentID: self.gatewayDefaultAgentId)
+    }
+
     var chatAgentName: String {
         self.agentDisplayName(for: self.chatAgentId, fallback: "Main")
     }
@@ -2646,6 +2670,7 @@ extension NodeAppModel {
         setOperatorConnected(false)
         self.talkMode.updateGatewayConnected(false)
         self.mainSessionBaseKey = "main"
+        self.gatewaySessionScope = nil
         self.talkMode.updateMainSessionKey(self.mainSessionKey)
         ShareGatewayRelaySettings.clearConfig()
         showLocalCanvasOnDisconnect()
@@ -2693,6 +2718,8 @@ extension NodeAppModel {
         self.voiceWakeSyncTask?.cancel()
         self.voiceWakeSyncTask = nil
         LiveActivityManager.shared.endActivity(reason: "new_gateway_connect")
+        self.mainSessionBaseKey = "main"
+        self.gatewaySessionScope = nil
         self.gatewayDefaultAgentId = nil
         self.gatewayAgents = []
         self.selectedAgentId = GatewaySettingsStore.loadGatewaySelectedAgentId(stableID: stableID)
@@ -3479,7 +3506,8 @@ extension NodeAppModel {
                 self.gatewayConnected = false
                 self.setOperatorConnected(false)
                 self.talkMode.updateGatewayConnected(false)
-                self.mainSessionBaseKey = "main"
+                // Retain the last verified routing contract for offline
+                // capture; reconnect compares it with the live gateway before replay.
                 self.talkMode.updateMainSessionKey(self.mainSessionKey)
                 self.showLocalCanvasOnDisconnect()
             }
@@ -3685,6 +3713,7 @@ extension NodeAppModel {
         self.talkMode.setEnabled(false)
         self.talkMode.statusText = "Demo mode only"
         self.mainSessionBaseKey = "main"
+        self.gatewaySessionScope = "per-sender"
         self.selectedAgentId = nil
         self.gatewayDefaultAgentId = "main"
         self.gatewayAgents = AppleReviewDemoMode.agents
@@ -3726,6 +3755,7 @@ extension NodeAppModel {
         self.setOperatorConnected(true)
         self.hasOperatorAdminScope = true
         self.mainSessionBaseKey = "main"
+        self.gatewaySessionScope = "per-sender"
         self.selectedAgentId = nil
         self.gatewayDefaultAgentId = "main"
         self.gatewayAgents = ScreenshotFixtureMode.agents
@@ -3889,10 +3919,10 @@ extension NodeAppModel {
         }
 
         let routeGeneration = self.gatewayRouteGeneration
-        guard let gatewayStableID = self.connectedGatewayID,
+        guard let gatewayStableID = connectedGatewayID,
               let nodeRoute = await nodeGateway.currentRoute(),
               shouldContinue(),
-              self.isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
+              isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
         else { return }
 
         do {
@@ -3993,7 +4023,7 @@ extension NodeAppModel {
         presentIn actions: [PendingForegroundNodeAction],
         gatewayStableID: String)
     {
-        guard let completed = self.completedPendingForegroundActionIDsByGateway[gatewayStableID] else {
+        guard let completed = completedPendingForegroundActionIDsByGateway[gatewayStableID] else {
             return
         }
         let retained = completed.intersection(actions.map(\.id))
@@ -4041,8 +4071,8 @@ extension NodeAppModel {
             let expectedRoute: GatewayNodeSessionRoute?
             if let routeContext {
                 guard self.activeGatewayConnectConfig?.effectiveStableID == routeContext.gatewayStableID,
-                      let currentRoute = await self.nodeGateway.currentRoute(),
-                      self.activeGatewayConnectConfig?.effectiveStableID == routeContext.gatewayStableID
+                      let currentRoute = await nodeGateway.currentRoute(),
+                      activeGatewayConnectConfig?.effectiveStableID == routeContext.gatewayStableID
                 else { return false }
                 expectedRoute = currentRoute
             } else {
@@ -5411,7 +5441,7 @@ extension NodeAppModel {
     func handleExecApprovalResolvedRemotePush(_ push: ExecApprovalNotificationPrompt) async -> Bool {
         switch await self.validateExecApprovalPushRoute(push, sourceReason: "push_resolved") {
         case let .validated(context):
-            let applied = await self.applyValidatedExecApprovalResolvedPush(push, context: context)
+            let applied = await applyValidatedExecApprovalResolvedPush(push, context: context)
             if !applied {
                 self.appendPendingExecApprovalResolvedPush(push)
             }
@@ -5980,7 +6010,7 @@ extension NodeAppModel {
         }
         guard let route,
               shouldContinue(),
-              self.isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
+              isCurrentGatewayRoute(generation: routeGeneration, stableID: gatewayStableID)
         else {
             return nil
         }
